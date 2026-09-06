@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -15,6 +16,34 @@ use ffmpeg_sidecar::{
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use walkdir::WalkDir;
+
+/// Video encoder to use for the re-encode step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum VideoEncoder {
+    /// Software x264 (CPU)
+    #[value(name = "x264")]
+    X264,
+    /// NVIDIA NVENC hardware encoder (h264_nvenc)
+    #[value(name = "nvenc")]
+    Nvenc,
+    /// AMD AMF hardware encoder (h264_amf)
+    #[value(name = "amf")]
+    Amf,
+    /// Intel Quick Sync Video hardware encoder (h264_qsv)
+    #[value(name = "qsv")]
+    Qsv,
+}
+
+impl VideoEncoder {
+    fn codec_name(self) -> &'static str {
+        match self {
+            VideoEncoder::X264 => "libx264",
+            VideoEncoder::Nvenc => "h264_nvenc",
+            VideoEncoder::Amf => "h264_amf",
+            VideoEncoder::Qsv => "h264_qsv",
+        }
+    }
+}
 
 /// Detect and remove black bars (letterboxing/pillarboxing) from videos under
 /// an input directory, mirroring the directory structure into the output
@@ -34,11 +63,17 @@ struct Args {
     #[arg(short = 's', long, default_value_t = 60)]
     crop_detect_seconds: u64,
 
-    /// Constant rate factor for the H.264 encode (lower = higher quality)
+    /// Quality factor for the H.264 encode, 0-51 (lower = higher quality).
+    /// CRF for x264, CQ for NVENC, global quality for QSV, QP for AMF.
     #[arg(short, long, default_value_t = 18)]
     crf: u32,
 
-    /// x264 encoding preset (ultrafast ... veryslow)
+    /// Video encoder: x264 (CPU), nvenc (NVIDIA), amf (AMD) or qsv (Intel)
+    #[arg(short = 'e', long, value_enum, default_value_t = VideoEncoder::X264)]
+    encoder: VideoEncoder,
+
+    /// x264-style encoding preset; hardware encoders map it to their own
+    /// presets automatically
     #[arg(short, long, default_value = "medium")]
     preset: String,
 }
@@ -178,6 +213,80 @@ fn is_full_frame(crop: &str, size: (u32, u32)) -> bool {
     crop == format!("{}:{}:0:0", size.0, size.1)
 }
 
+/// Builds the ffmpeg output arguments for the video encoder, translating the
+/// quality factor and x264-style preset to each encoder's own options.
+fn video_encoder_args(encoder: VideoEncoder, crf: u32, preset: &str) -> Vec<String> {
+    let crf = crf.to_string();
+    match encoder {
+        VideoEncoder::X264 => vec![
+            "-c:v".into(),
+            "libx264".into(),
+            "-crf".into(),
+            crf,
+            "-preset".into(),
+            preset.into(),
+        ],
+        VideoEncoder::Nvenc => vec![
+            "-c:v".into(),
+            "h264_nvenc".into(),
+            "-rc".into(),
+            "vbr".into(),
+            "-cq".into(),
+            crf,
+            "-b:v".into(),
+            "0".into(),
+            "-preset".into(),
+            nvenc_preset(preset).into(),
+        ],
+        VideoEncoder::Qsv => vec![
+            "-c:v".into(),
+            "h264_qsv".into(),
+            "-global_quality".into(),
+            crf,
+            "-preset".into(),
+            preset.into(),
+        ],
+        VideoEncoder::Amf => vec![
+            "-c:v".into(),
+            "h264_amf".into(),
+            "-rc".into(),
+            "cqp".into(),
+            "-qp_i".into(),
+            crf.clone(),
+            "-qp_p".into(),
+            crf,
+            "-quality".into(),
+            amf_quality(preset).into(),
+        ],
+    }
+}
+
+/// Maps x264-style presets to NVENC's p1 (fastest) through p7 (best quality)
+/// presets. NVENC preset names (p1-p7) are passed through unchanged.
+fn nvenc_preset(preset: &str) -> String {
+    match preset {
+        "ultrafast" => "p1",
+        "superfast" => "p2",
+        "veryfast" | "faster" | "fast" => "p3",
+        "medium" => "p4",
+        "slow" => "p5",
+        "slower" => "p6",
+        "veryslow" => "p7",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// Maps x264-style presets to AMF's usage-quality presets.
+fn amf_quality(preset: &str) -> String {
+    match preset {
+        "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" => "speed",
+        "medium" => "balanced",
+        _ => "quality",
+    }
+    .to_string()
+}
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     run()
@@ -187,6 +296,7 @@ fn run() -> color_eyre::Result<()> {
     let args = Args::parse();
 
     ensure_ffmpeg()?;
+    ensure_encoder(args.encoder)?;
 
     let input_dir = resolve_existing_dir(&args.input, "Input")?;
     let output_dir = resolve_output_dir(&args.output)?;
@@ -257,6 +367,41 @@ fn ensure_ffmpeg() -> color_eyre::Result<()> {
 
     if !available {
         bail!("ffmpeg is not installed or not in PATH");
+    }
+
+    Ok(())
+}
+
+/// Verifies the selected encoder is compiled into the system's ffmpeg build
+/// before processing any files. Note that this cannot detect a missing GPU or
+/// driver; that only surfaces when the first encode runs.
+fn ensure_encoder(encoder: VideoEncoder) -> color_eyre::Result<()> {
+    let codec = encoder.codec_name();
+
+    let mut child = FfmpegCommand::new()
+        .arg("-encoders")
+        .spawn()
+        .wrap_err("Failed to start ffmpeg")?;
+
+    let mut list = String::new();
+    if let Some(mut stdout) = child.take_stdout() {
+        stdout
+            .read_to_string(&mut list)
+            .wrap_err("Failed to read ffmpeg encoder list")?;
+    }
+    child
+        .wait()
+        .wrap_err("FFmpeg encoder list process failed")?;
+
+    let available = list
+        .lines()
+        .any(|line| line.split_whitespace().any(|token| token == codec));
+
+    if !available {
+        bail!(
+            "Encoder {codec} is not available in this ffmpeg build; \
+             use '-e x264' or install an ffmpeg build with {codec} support"
+        );
     }
 
     Ok(())
@@ -475,9 +620,7 @@ fn encode_video(
         .input(input.to_string_lossy())
         .args(["-vf", crop_filter])
         .map("0")
-        .codec_video("libx264")
-        .crf(args.crf)
-        .preset(&args.preset)
+        .args(video_encoder_args(args.encoder, args.crf, &args.preset))
         .codec_audio("copy")
         .codec_subtitle("copy")
         .output(output.to_string_lossy());
@@ -696,5 +839,105 @@ mod tests {
                 "error line".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn nvenc_preset_presets_are_mapped_monotonically() {
+        assert_eq!(nvenc_preset("ultrafast"), "p1");
+        assert_eq!(nvenc_preset("veryfast"), "p3");
+        assert_eq!(nvenc_preset("medium"), "p4");
+        assert_eq!(nvenc_preset("slow"), "p5");
+        assert_eq!(nvenc_preset("veryslow"), "p7");
+    }
+
+    #[test]
+    fn nvenc_preset_passes_through_unknown_names() {
+        assert_eq!(nvenc_preset("p2"), "p2");
+        assert_eq!(nvenc_preset("llhq"), "llhq");
+    }
+
+    #[test]
+    fn amf_quality_presets_are_mapped() {
+        assert_eq!(amf_quality("ultrafast"), "speed");
+        assert_eq!(amf_quality("fast"), "speed");
+        assert_eq!(amf_quality("medium"), "balanced");
+        assert_eq!(amf_quality("slow"), "quality");
+        assert_eq!(amf_quality("veryslow"), "quality");
+    }
+
+    #[test]
+    fn encoder_args_for_x264() {
+        assert_eq!(
+            video_encoder_args(VideoEncoder::X264, 18, "medium"),
+            vec![
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-crf".to_string(),
+                "18".to_string(),
+                "-preset".to_string(),
+                "medium".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn encoder_args_for_nvenc() {
+        assert_eq!(
+            video_encoder_args(VideoEncoder::Nvenc, 18, "medium"),
+            vec![
+                "-c:v".to_string(),
+                "h264_nvenc".to_string(),
+                "-rc".to_string(),
+                "vbr".to_string(),
+                "-cq".to_string(),
+                "18".to_string(),
+                "-b:v".to_string(),
+                "0".to_string(),
+                "-preset".to_string(),
+                "p4".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn encoder_args_for_qsv() {
+        assert_eq!(
+            video_encoder_args(VideoEncoder::Qsv, 20, "slow"),
+            vec![
+                "-c:v".to_string(),
+                "h264_qsv".to_string(),
+                "-global_quality".to_string(),
+                "20".to_string(),
+                "-preset".to_string(),
+                "slow".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn encoder_args_for_amf() {
+        assert_eq!(
+            video_encoder_args(VideoEncoder::Amf, 22, "veryslow"),
+            vec![
+                "-c:v".to_string(),
+                "h264_amf".to_string(),
+                "-rc".to_string(),
+                "cqp".to_string(),
+                "-qp_i".to_string(),
+                "22".to_string(),
+                "-qp_p".to_string(),
+                "22".to_string(),
+                "-quality".to_string(),
+                "quality".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn encoder_codec_names_match_value_names() {
+        assert_eq!(VideoEncoder::X264.codec_name(), "libx264");
+        assert_eq!(VideoEncoder::Nvenc.codec_name(), "h264_nvenc");
+        assert_eq!(VideoEncoder::Amf.codec_name(), "h264_amf");
+        assert_eq!(VideoEncoder::Qsv.codec_name(), "h264_qsv");
     }
 }

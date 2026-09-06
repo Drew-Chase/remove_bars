@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- Hardware-accelerated encoding via `-e` / `--encoder`: `nvenc` (NVIDIA),
+  `amf` (AMD) and `qsv` (Intel), alongside the default software `x264`
+  encoder. The quality factor and preset are translated to each encoder's own
+  options (CRF/CQ/global quality/QP, x264 presets to NVENC `p1`–`p7` or AMF
+  `speed`/`balanced`/`quality`), and the selected encoder is verified against
+  the installed ffmpeg build before processing starts.
+
 ## 0.1.1 - 2026-09-06
 
 ### Fixed

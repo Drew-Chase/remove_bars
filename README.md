@@ -56,10 +56,37 @@ remove_bars --input ./videos --output ./cropped --crf 20 --preset slow
 | `-i`, `--input` | `<DIR>` | `input` | Directory containing the videos to process |
 | `-o`, `--output` | `<DIR>` | `output` | Directory to write processed videos to |
 | `-s`, `--crop-detect-seconds` | `<SECONDS>` | `60` | Seconds of video to analyze, starting 30s into the file |
-| `-c`, `--crf` | `<CRF>` | `18` | Constant rate factor for the H.264 encode, 0–51 (lower = higher quality) |
-| `-p`, `--preset` | `<PRESET>` | `medium` | x264 encoding preset (`ultrafast` … `veryslow`) |
+| `-c`, `--crf` | `<CRF>` | `18` | Quality factor for the H.264 encode, 0–51 (lower = higher quality); translated per encoder, see [hardware acceleration](#hardware-acceleration) |
+| `-e`, `--encoder` | `<ENCODER>` | `x264` | Video encoder: `x264` (CPU), `nvenc` (NVIDIA), `amf` (AMD) or `qsv` (Intel) |
+| `-p`, `--preset` | `<PRESET>` | `medium` | x264-style encoding preset (`ultrafast` … `veryslow`); hardware encoders map it to their own presets |
 | `-h`, `--help` | | | Print help |
 | `-V`, `--version` | | | Print version |
+
+### Hardware acceleration
+
+Encoding can be offloaded to the GPU with `-e` / `--encoder`:
+
+| Value | ffmpeg encoder | Hardware |
+|-------|----------------|----------|
+| `x264` (default) | libx264 | CPU |
+| `nvenc` | h264_nvenc | NVIDIA (NVENC) |
+| `amf` | h264_amf | AMD (AMF / VCE) |
+| `qsv` | h264_qsv | Intel (Quick Sync Video) |
+
+```sh
+remove_bars -i ./videos -o ./cropped -e nvenc
+```
+
+The quality factor (`-c`) is translated for each encoder: CRF for x264, CQ
+with VBR rate control for NVENC, global quality for QSV and constant QP for
+AMF. The preset (`-p`) is passed to x264 and QSV unchanged, mapped to NVENC's
+`p1`–`p7` presets (e.g. `medium` → `p4`, `veryslow` → `p7`), and mapped to
+AMF's `speed`/`balanced`/`quality` presets. NVENC preset names (`p1`–`p7`)
+are passed through as-is.
+
+If the selected encoder is not compiled into the installed ffmpeg build, the
+tool exits before processing any files. A missing GPU or driver surfaces as an
+ffmpeg error when the first file is encoded.
 
 ### Example output
 
