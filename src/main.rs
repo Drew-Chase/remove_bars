@@ -12,6 +12,7 @@ use ffmpeg_sidecar::{
     command::FfmpegCommand,
     event::{FfmpegEvent, LogLevel},
 };
+use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use walkdir::WalkDir;
 
@@ -493,29 +494,56 @@ fn encode_video(
         .wrap_err("Failed to start ffmpeg for encoding")?;
 
     let mut capture = LogCapture::new(10);
+    let mut duration_secs: Option<f64> = None;
+    let mut fps: Option<f32> = None;
+    let mut bar: Option<ProgressBar> = None;
+    let file_name = output
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     for event in child
         .iter()
         .map_err(|err| eyre!("Failed to read ffmpeg output: {err}"))?
     {
         match event {
+            FfmpegEvent::ParsedDuration(parsed) => duration_secs = Some(parsed.duration),
+            FfmpegEvent::ParsedInputStream(stream) => {
+                if let Some(video) = stream.video_data() {
+                    fps = Some(video.fps);
+                }
+            }
             FfmpegEvent::Progress(progress) => {
-                let line = format!(
-                    "  time={} speed={:.2}x fps={:.0}",
-                    progress.time, progress.speed, progress.fps
-                );
-                eprint!("\r{line:<70}");
+                let bar = bar.get_or_insert_with(|| {
+                    create_progress_bar(&file_name, estimated_total_frames(duration_secs, fps))
+                });
+                bar.set_position(progress.frame as u64);
+                bar.set_message(if progress.fps > 0.0 {
+                    format!(
+                        "{file_name} ({:.2}x, {:.0} fps)",
+                        progress.speed, progress.fps
+                    )
+                } else {
+                    format!("{file_name} ({:.2}x)", progress.speed)
+                });
             }
             FfmpegEvent::Log(level, line) => {
                 if matches!(level, LogLevel::Error | LogLevel::Fatal) {
-                    eprintln!("{line}");
+                    match &bar {
+                        Some(bar) => bar.println(&line),
+                        None => eprintln!("{line}"),
+                    }
                 }
                 capture.push(level, &line);
             }
             _ => {}
         }
     }
-    eprintln!();
+
+    if let Some(bar) = bar {
+        bar.finish_and_clear();
+    }
 
     let succeeded = child
         .wait()
@@ -527,6 +555,40 @@ fn encode_video(
     }
 
     Ok(succeeded)
+}
+
+/// Estimates the total number of output frames from the input duration and
+/// video framerate, both parsed from ffmpeg's input metadata.
+fn estimated_total_frames(duration_secs: Option<f64>, fps: Option<f32>) -> Option<u64> {
+    let total = duration_secs? * fps? as f64;
+    (total > 0.0).then(|| total.round() as u64)
+}
+
+fn create_progress_bar(file_name: &str, total_frames: Option<u64>) -> ProgressBar {
+    match total_frames {
+        Some(total) => {
+            let bar = ProgressBar::new(total);
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "Encoding {msg} [{wide_bar:.cyan/blue}] {percent:>3}% {pos}/{len} frames eta {eta}",
+                )
+                .expect("progress bar template is valid")
+                .progress_chars("█░"),
+            );
+            bar.set_message(file_name.to_string());
+            bar
+        }
+        None => {
+            let bar = ProgressBar::new_spinner();
+            bar.set_style(
+                ProgressStyle::with_template("Encoding {msg} {pos} frames")
+                    .expect("progress bar template is valid"),
+            );
+            bar.set_message(file_name.to_string());
+            bar.enable_steady_tick(std::time::Duration::from_millis(200));
+            bar
+        }
+    }
 }
 
 #[cfg(test)]
