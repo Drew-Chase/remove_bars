@@ -536,6 +536,8 @@ fn run_scan(
     let mut no_crop = 0;
     let mut errors = 0;
 
+    let msg_width = progress_message_width();
+
     for chunk_start in (0..total).step_by(SCAN_BATCH_SIZE) {
         let chunk = &video_files[chunk_start..(chunk_start + SCAN_BATCH_SIZE).min(total)];
         let chunk_rows: Vec<ScanRow> = pool.install(|| {
@@ -551,6 +553,7 @@ fn run_scan(
                         crop_detect_start,
                         crop_detect_seconds,
                         threshold,
+                        msg_width,
                         &bar,
                     )
                 })
@@ -595,6 +598,24 @@ fn run_scan(
     Ok(())
 }
 
+/// Pads or truncates text to a fixed display width (Unicode-aware): short
+/// text is padded with spaces, long text is truncated with an ellipsis.
+fn fixed_width(text: &str, width: usize) -> String {
+    console::pad_str(text, width, console::Alignment::Left, Some("…")).to_string()
+}
+
+/// Fixed character width for file names in progress bar messages, derived
+/// from the terminal width so the bar and counters keep room on narrow
+/// terminals. Falls back to 32 when the terminal size is unknown.
+fn progress_message_width() -> usize {
+    const RESERVED: usize = 42;
+    const FALLBACK: usize = 32;
+    console::Term::stderr()
+        .size_checked()
+        .map(|(_, columns)| (columns as usize).saturating_sub(RESERVED).clamp(16, 48))
+        .unwrap_or(FALLBACK)
+}
+
 /// Runs crop detection for a single file. Executed on the rayon pool; progress
 /// and per-file results are printed through the progress bar so the output
 /// stays intact while files finish in parallel.
@@ -606,6 +627,7 @@ fn scan_one(
     crop_detect_start: u64,
     crop_detect_seconds: u64,
     threshold: u32,
+    msg_width: usize,
     bar: &ProgressBar,
 ) -> ScanRow {
     let name = file
@@ -613,7 +635,7 @@ fn scan_one(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    bar.set_message(name.clone());
+    bar.set_message(fixed_width(&name, msg_width));
 
     // indicatif drops lines printed through a hidden progress bar (piped
     // output), so fall back to plain stderr printing in that case.
@@ -1323,13 +1345,11 @@ fn encode_video(
                     create_progress_bar(&file_name, estimated_total_frames(duration_secs, fps))
                 });
                 bar.set_position(progress.frame as u64);
+                let name = fixed_width(&file_name, progress_message_width());
                 bar.set_message(if progress.fps > 0.0 {
-                    format!(
-                        "{file_name} ({:.2}x, {:.0} fps)",
-                        progress.speed, progress.fps
-                    )
+                    format!("{name} ({:.2}x, {:.0} fps)", progress.speed, progress.fps)
                 } else {
-                    format!("{file_name} ({:.2}x)", progress.speed)
+                    format!("{name} ({:.2}x)", progress.speed)
                 });
             }
             FfmpegEvent::Log(level, line) => {
@@ -1483,6 +1503,30 @@ mod tests {
         assert!(!is_within_threshold("", (1920, 1080), 8));
         // A crop wider than the source frame cannot be trusted.
         assert!(!is_within_threshold("1920:240:0:0", (320, 240), 8));
+    }
+
+    #[test]
+    fn fixed_width_pads_short_text() {
+        assert_eq!(fixed_width("ab", 5), "ab   ");
+    }
+
+    #[test]
+    fn fixed_width_keeps_exact_fits() {
+        assert_eq!(fixed_width("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn fixed_width_truncates_with_ellipsis() {
+        let result = fixed_width("abcdefgh", 5);
+        assert_eq!(result, "abcd…");
+        assert_eq!(console::measure_text_width(&result), 5);
+    }
+
+    #[test]
+    fn fixed_width_is_display_width_aware() {
+        // CJK characters occupy two terminal columns each.
+        let result = fixed_width("日本語テスト", 5);
+        assert_eq!(console::measure_text_width(&result), 5);
     }
 
     #[test]

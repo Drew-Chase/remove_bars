@@ -601,6 +601,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "colored",
+ "console",
  "ffmpeg-sidecar",
  "indicatif",
  "rayon",
