@@ -2,35 +2,52 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased
+## 1.0.0 - 2026-09-06
 
 ### Added
 
-- Parallel scanning: `scan` detects crops on multiple videos concurrently
-  using rayon (`-j` / `--parallel`, defaulting to the CPU core count).
-  Results are buffered in memory and written to the scan database in batches
-  of 100, with a progress bar showing overall scan progress.
-- `--threshold` option for `scan` and `crop` (default 8 pixels): detected
-  crops that trim at most this many pixels from any edge of the frame are
-  treated as needing no crop, so round-to-16 detection artifacts no longer
-  trigger pointless re-encodes. Cropping from a scan database re-applies the
-  threshold against the indexed crop values.
-- `--crop-detect-start` option for `scan` and `crop`: chooses where crop
-  detection starts in each video (default 30s), used together with
-  `--crop-detect-seconds` to control the analyzed window.
 - `scan` subcommand: analyzes every video under a directory with cropdetect
   and indexes the results (relative path, detected crop value, source
   resolution, whether cropping is needed) into an SQLite database, without
-  modifying any files.
-- `crop` subcommand: replaces the previous top-level command and now accepts
+  modifying any files. Detection runs in parallel using rayon
+  (`-j` / `--parallel`, defaulting to the CPU core count); results are
+  buffered in memory and written to the database in batches of 100, with a
+  progress bar showing overall progress. Re-running a scan replaces the
+  previous database contents.
+- `crop` subcommand: replaces the previous top-level command and accepts
   either a directory or a scan database as input. Database input reuses the
   indexed crop values instead of re-running detection, reports indexed files
   that have since been moved or deleted, and supports all existing options
   (encoder selection, in-place mode, copy-uncropped).
+- `--overwrite-original`: encodes to a temporary file next to the original and
+  replaces the original only after a successful encode, for in-place
+  automation. `-o` / `--output` is ignored in this mode. Uncropped files are
+  left untouched, so re-running on already-cropped libraries is safe.
+- `--copy-uncropped`: copies files that need no cropping to the output
+  directory.
+- `--threshold` option for `scan` and `crop` (default 8 pixels): detected
+  crops that trim at most this many pixels from any edge of the frame are
+  treated as needing no crop, so round-to-16 detection artifacts no longer
+  trigger pointless re-encodes. Cropping from a scan database re-applies the
+  threshold against the indexed crop values, so it can be more aggressive
+  than the scan was.
+- `--crop-detect-start` option for `scan` and `crop`: chooses where crop
+  detection starts in each video (default 30s), used together with
+  `--crop-detect-seconds` to control the analyzed window.
+- Redesigned two-line progress bars for scanning and encoding: the label
+  (including file name, speed and fps for encodes) sits on the left and the
+  percentage, frame/file count and ETA are right-aligned on the same line,
+  with the bar on its own full-width line below. Long file names are
+  truncated with an ellipsis, and the ETA is estimated from elapsed time and
+  progress rate.
 
 ### Changed
 
-- `remove_bars` now requires a subcommand (`scan` or `crop`).
+- `remove_bars` now requires a subcommand (`scan` or `crop`); running it
+  without one prints help.
+- Files that need no cropping are now skipped by default instead of being
+  copied to the output directory; pass `--copy-uncropped` to restore the
+  previous behavior.
 
 ## 0.2.0 - 2026-09-06
 
