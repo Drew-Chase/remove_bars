@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- `scan` subcommand: analyzes every video under a directory with cropdetect
+  and indexes the results (relative path, detected crop value, source
+  resolution, whether cropping is needed) into an SQLite database, without
+  modifying any files.
+- `crop` subcommand: replaces the previous top-level command and now accepts
+  either a directory or a scan database as input. Database input reuses the
+  indexed crop values instead of re-running detection, reports indexed files
+  that have since been moved or deleted, and supports all existing options
+  (encoder selection, in-place mode, copy-uncropped).
+
+### Changed
+
+- `remove_bars` now requires a subcommand (`scan` or `crop`).
+
 ## 0.2.0 - 2026-09-06
 
 ### Added

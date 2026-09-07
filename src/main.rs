@@ -4,9 +4,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::LazyLock,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::eyre::{WrapErr, bail, eyre};
 use colored::Colorize;
 use ffmpeg_sidecar::{
@@ -15,6 +16,7 @@ use ffmpeg_sidecar::{
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
+use rusqlite::{Connection, OpenFlags, params};
 use walkdir::WalkDir;
 
 /// Video encoder to use for the re-encode step.
@@ -45,20 +47,55 @@ impl VideoEncoder {
     }
 }
 
-/// Detect and remove black bars (letterboxing/pillarboxing) from videos under
-/// an input directory, mirroring the directory structure into the output
-/// directory.
+/// Detect and remove black bars (letterboxing/pillarboxing) from videos.
 #[derive(Parser, Debug)]
-#[command(version, about)]
-struct Args {
-    /// Directory containing the videos to process
-    #[arg(short, long, default_value = "input")]
-    input: PathBuf,
+#[command(
+    version,
+    about,
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Directory to write processed videos to
-    #[arg(short, long, default_value = "output")]
-    output: PathBuf,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Scan a directory and index which videos need cropping into an SQLite
+    /// database, without modifying any files
+    Scan {
+        /// Directory containing the videos to scan
+        #[arg(short, long, default_value = "input")]
+        input: PathBuf,
 
+        /// SQLite database file to write
+        #[arg(short, long, default_value = "scan.sqlite")]
+        output: PathBuf,
+
+        /// Seconds of video to analyze, starting 30s into the file
+        #[arg(short = 's', long, default_value_t = 60)]
+        crop_detect_seconds: u64,
+    },
+
+    /// Crop videos in a directory, or videos indexed by a previous scan
+    Crop {
+        /// Directory of videos, or a scan database file
+        #[arg(short, long, default_value = "input")]
+        input: PathBuf,
+
+        /// Directory to write processed videos to
+        #[arg(short, long, default_value = "output")]
+        output: PathBuf,
+
+        #[command(flatten)]
+        encode: EncodeArgs,
+    },
+}
+
+/// Options that control how videos are cropped and encoded.
+#[derive(clap::Args, Debug)]
+struct EncodeArgs {
     /// Seconds of video to analyze, starting 30s into the file
     #[arg(short = 's', long, default_value_t = 60)]
     crop_detect_seconds: u64,
@@ -76,6 +113,16 @@ struct Args {
     /// presets automatically
     #[arg(short, long, default_value = "medium")]
     preset: String,
+
+    /// Copy files that need no cropping to the output directory instead of
+    /// skipping them
+    #[arg(long)]
+    copy_uncropped: bool,
+
+    /// Encode to a temporary file next to the original and replace the
+    /// original only after a successful encode (-o/--output is ignored)
+    #[arg(long, conflicts_with = "copy_uncropped")]
+    overwrite_original: bool,
 }
 
 const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "mov", "wmv", "m4v", "webm"];
@@ -88,6 +135,20 @@ enum Outcome {
     Processed,
     Skipped,
     Failed,
+}
+
+/// Where encoded output goes: a mirrored output directory, or in-place
+/// replacement of the original file.
+enum OutputMode {
+    Mirror(PathBuf),
+    InPlace,
+}
+
+/// Where a file's crop value comes from: a live cropdetect run, or a previous
+/// scan (`Some(crop)` = crop this value, `None` = scan found no bars).
+enum CropSource {
+    Detect,
+    Scan(Option<String>),
 }
 
 struct CropDetection {
@@ -289,39 +350,96 @@ fn amf_quality(preset: &str) -> String {
 
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    run()
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Scan {
+            input,
+            output,
+            crop_detect_seconds,
+        } => run_scan(input, output, crop_detect_seconds),
+        Command::Crop {
+            input,
+            output,
+            encode,
+        } => run_crop(input, output, encode),
+    }
 }
 
-fn run() -> color_eyre::Result<()> {
-    let args = Args::parse();
-
-    ensure_ffmpeg()?;
-    ensure_encoder(args.encoder)?;
-
-    let input_dir = resolve_existing_dir(&args.input, "Input")?;
-    let output_dir = resolve_output_dir(&args.output)?;
-
-    let video_files = find_video_files(&input_dir);
-    let total = video_files.len();
-
-    if total == 0 {
-        println!(
-            "{} No video files found in: {}",
-            "WARNING:".yellow(),
-            input_dir.display()
-        );
-        return Ok(());
-    }
-
+fn print_header() {
     println!("{}", "========================================".cyan());
     println!("{}", "Black Bar Removal".cyan().bold());
     println!("{}", "========================================".cyan());
-    println!("Input:  {}", input_dir.display());
-    println!("Output: {}", output_dir.display());
-    println!("Found {total} video file(s) to process");
+}
+
+fn print_output_target(output: &OutputMode) {
+    match output {
+        OutputMode::Mirror(dir) => println!("Output: {}", dir.display()),
+        OutputMode::InPlace => println!("Mode:   in-place (originals are overwritten)"),
+    }
+}
+
+fn print_summary(processed: usize, skipped: usize, failed: usize, total: usize) {
+    println!();
+    println!("{}", "========================================".cyan());
+    println!("{}", "PROCESSING COMPLETE".green().bold());
+    println!("{}", "========================================".cyan());
+    println!("Processed: {processed}");
+    println!("Skipped:   {skipped}");
+    println!("Failed:    {failed}");
+    println!("Total:     {total}");
+}
+
+fn run_scan(input: PathBuf, output: PathBuf, crop_detect_seconds: u64) -> color_eyre::Result<()> {
+    ensure_ffmpeg()?;
+
+    let input_dir = resolve_existing_dir(&input, "Input")?;
+    let video_files = find_video_files(&input_dir);
+    let total = video_files.len();
+
+    print_header();
+    println!("Input:    {}", input_dir.display());
+    println!("Database: {}", output.display());
+    println!("Found {total} video file(s) to scan");
     println!("{}", "========================================".cyan());
 
-    let (mut processed, mut skipped, mut failed) = (0, 0, 0);
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    let connection = Connection::open(&output)
+        .with_context(|| format!("Failed to open scan database: {}", output.display()))?;
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS videos;
+             DROP TABLE IF EXISTS meta;
+             CREATE TABLE meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE videos (
+                 path       TEXT PRIMARY KEY,
+                 crop       TEXT,
+                 width      INTEGER,
+                 height     INTEGER,
+                 needs_crop INTEGER NOT NULL,
+                 status     TEXT NOT NULL,
+                 scanned_at INTEGER NOT NULL
+             );",
+        )
+        .wrap_err("Failed to initialize scan database schema")?;
+
+    let scanned_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+
+    let mut needs_crop = 0;
+    let mut no_crop = 0;
+    let mut errors = 0;
 
     for (index, file) in video_files.iter().enumerate() {
         println!();
@@ -338,21 +456,315 @@ fn run() -> color_eyre::Result<()> {
                 .yellow()
         );
 
-        match process_file(file, &input_dir, &output_dir, &args) {
+        let relative = match file.strip_prefix(&input_dir) {
+            Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+            Err(err) => {
+                eprintln!("{} {err:#}", "ERROR:".red().bold());
+                errors += 1;
+                continue;
+            }
+        };
+
+        let detection = match detect_crop(file, crop_detect_seconds) {
+            Ok(detection) => detection,
+            Err(err) => {
+                eprintln!("{} {err:#}", "ERROR:".red().bold());
+                errors += 1;
+                insert_scan_row(
+                    &connection,
+                    &relative,
+                    None,
+                    None,
+                    None,
+                    false,
+                    "error",
+                    scanned_at,
+                )?;
+                continue;
+            }
+        };
+
+        if detection.failed && detection.crop.is_none() {
+            eprintln!(
+                "{}",
+                "FAILED: FFmpeg returned an error during crop detection"
+                    .red()
+                    .bold()
+            );
+            detection.diagnostics.print();
+            errors += 1;
+            insert_scan_row(
+                &connection,
+                &relative,
+                None,
+                None,
+                None,
+                false,
+                "error",
+                scanned_at,
+            )?;
+            continue;
+        }
+
+        let is_full_frame = detection
+            .crop
+            .as_deref()
+            .zip(detection.source_size)
+            .is_some_and(|(crop, size)| is_full_frame(crop, size));
+
+        let (crop, needs) = match &detection.crop {
+            Some(value) if !is_full_frame => {
+                println!("{}", format!("Needs cropping: crop={value}").green());
+                needs_crop += 1;
+                (Some(value.clone()), true)
+            }
+            Some(value) => {
+                println!("{}", "No black bars detected".yellow());
+                no_crop += 1;
+                (Some(value.clone()), false)
+            }
+            None => {
+                println!("{}", "No black bars detected".yellow());
+                no_crop += 1;
+                (None, false)
+            }
+        };
+        let (width, height) = detection
+            .source_size
+            .map(|(w, h)| (Some(w), Some(h)))
+            .unwrap_or((None, None));
+
+        insert_scan_row(
+            &connection,
+            &relative,
+            crop,
+            width,
+            height,
+            needs,
+            "scanned",
+            scanned_at,
+        )?;
+    }
+
+    connection
+        .execute(
+            "INSERT INTO meta (key, value) VALUES ('input_root', ?1)",
+            params![input_dir.to_string_lossy()],
+        )
+        .wrap_err("Failed to write scan metadata")?;
+
+    println!();
+    println!("{}", "========================================".cyan());
+    println!("{}", "SCAN COMPLETE".green().bold());
+    println!("{}", "========================================".cyan());
+    println!("Need cropping: {needs_crop}");
+    println!("No crop:       {no_crop}");
+    println!("Errors:        {errors}");
+    println!("Total:         {total}");
+    println!("Scan database saved: {}", output.display());
+
+    Ok(())
+}
+
+fn insert_scan_row(
+    connection: &Connection,
+    path: &str,
+    crop: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    needs_crop: bool,
+    status: &str,
+    scanned_at: i64,
+) -> color_eyre::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO videos (path, crop, width, height, needs_crop, status, scanned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                path,
+                crop,
+                width,
+                height,
+                needs_crop as i64,
+                status,
+                scanned_at
+            ],
+        )
+        .with_context(|| format!("Failed to index {path}"))?;
+    Ok(())
+}
+
+struct ScanEntry {
+    path: String,
+    crop: Option<String>,
+    needs_crop: bool,
+}
+
+/// Reads the indexed videos and the scanned input root from a scan database.
+fn read_scan_db(db_path: &Path) -> color_eyre::Result<(PathBuf, Vec<ScanEntry>)> {
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open scan database: {}", db_path.display()))?;
+
+    let input_root: String = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'input_root'",
+            [],
+            |row| row.get(0),
+        )
+        .with_context(|| {
+            format!(
+                "Scan database has no input root; was {} created by 'remove_bars scan'?",
+                db_path.display()
+            )
+        })?;
+
+    let mut statement = connection
+        .prepare("SELECT path, crop, needs_crop FROM videos ORDER BY path")
+        .with_context(|| format!("Failed to read scan database: {}", db_path.display()))?;
+    let entries = statement
+        .query_map([], |row| {
+            Ok(ScanEntry {
+                path: row.get(0)?,
+                crop: row.get(1)?,
+                needs_crop: row.get::<_, i64>(2)? != 0,
+            })
+        })
+        .wrap_err("Failed to read scan database")?
+        .collect::<Result<Vec<_>, _>>()
+        .wrap_err("Failed to read scan database")?;
+
+    Ok((PathBuf::from(input_root), entries))
+}
+
+fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::Result<()> {
+    ensure_ffmpeg()?;
+    ensure_encoder(encode.encoder)?;
+
+    let output_mode = if encode.overwrite_original {
+        OutputMode::InPlace
+    } else {
+        OutputMode::Mirror(resolve_output_dir(&output)?)
+    };
+
+    struct CropJob {
+        file: PathBuf,
+        relative: PathBuf,
+        source: CropSource,
+    }
+
+    let mut jobs: Vec<CropJob> = Vec::new();
+
+    print_header();
+    if input.is_dir() {
+        let input_dir = resolve_existing_dir(&input, "Input")?;
+        let video_files = find_video_files(&input_dir);
+        println!("Input:  {}", input_dir.display());
+        print_output_target(&output_mode);
+        println!("Found {} video file(s) to process", video_files.len());
+        println!("{}", "========================================".cyan());
+
+        for file in video_files {
+            let relative = file
+                .strip_prefix(&input_dir)
+                .wrap_err("Failed to compute relative path")?
+                .to_path_buf();
+            jobs.push(CropJob {
+                file,
+                relative,
+                source: CropSource::Detect,
+            });
+        }
+    } else if input.is_file() {
+        if !input.exists() {
+            bail!("Scan database not found: {}", input.display());
+        }
+        let (input_root, entries) = read_scan_db(&input)?;
+        let input_root = input_root.canonicalize().with_context(|| {
+            format!(
+                "Scanned input root no longer exists: {}",
+                input_root.display()
+            )
+        })?;
+        println!("Scan:   {}", input.display());
+        println!("Input:  {}", input_root.display());
+        print_output_target(&output_mode);
+        let needs_crop = entries.iter().filter(|entry| entry.needs_crop).count();
+        println!(
+            "Indexed {} video file(s), {} need cropping",
+            entries.len(),
+            needs_crop
+        );
+        println!("{}", "========================================".cyan());
+
+        for entry in entries {
+            let source = if entry.needs_crop {
+                match entry.crop {
+                    Some(crop) => CropSource::Scan(Some(crop)),
+                    None => CropSource::Detect,
+                }
+            } else {
+                CropSource::Scan(None)
+            };
+            jobs.push(CropJob {
+                file: input_root.join(&entry.path),
+                relative: PathBuf::from(&entry.path),
+                source,
+            });
+        }
+    } else if !input.exists() {
+        bail!("Input path does not exist: {}", input.display());
+    } else {
+        bail!(
+            "Input path is neither a directory nor a scan database: {}",
+            input.display()
+        );
+    }
+
+    if jobs.is_empty() {
+        println!("{} No video files found", "WARNING:".yellow());
+        return Ok(());
+    }
+
+    let total = jobs.len();
+    let (mut processed, mut skipped, mut failed) = (0, 0, 0);
+
+    for (index, job) in jobs.iter().enumerate() {
+        println!();
+        println!(
+            "{}",
+            "----------------------------------------".bright_black()
+        );
+        println!(
+            "{} {}",
+            format!("[{}/{}]", index + 1, total).yellow(),
+            job.file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .yellow()
+        );
+
+        if !job.file.exists() {
+            println!(
+                "{}",
+                format!(
+                    "SKIPPED: file not found (moved or renamed since the scan): {}",
+                    job.file.display()
+                )
+                .bright_black()
+            );
+            skipped += 1;
+            continue;
+        }
+
+        match process_file(&job.file, &job.relative, &output_mode, &encode, &job.source) {
             Outcome::Processed => processed += 1,
             Outcome::Skipped => skipped += 1,
             Outcome::Failed => failed += 1,
         }
     }
 
-    println!();
-    println!("{}", "========================================".cyan());
-    println!("{}", "PROCESSING COMPLETE".green().bold());
-    println!("{}", "========================================".cyan());
-    println!("Processed: {processed}");
-    println!("Skipped:   {skipped}");
-    println!("Failed:    {failed}");
-    println!("Total:     {total}");
+    print_summary(processed, skipped, failed, total);
 
     Ok(())
 }
@@ -444,65 +856,98 @@ fn find_video_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn process_file(file: &Path, input_dir: &Path, output_dir: &Path, args: &Args) -> Outcome {
-    let relative = match file.strip_prefix(input_dir) {
-        Ok(relative) => relative,
-        Err(err) => {
-            eprintln!("{} {err:#}", "ERROR:".red().bold());
-            return Outcome::Failed;
-        }
+fn process_file(
+    file: &Path,
+    relative: &Path,
+    output: &OutputMode,
+    encode: &EncodeArgs,
+    source: &CropSource,
+) -> Outcome {
+    let in_place = matches!(output, OutputMode::InPlace);
+    let output_file = match output {
+        OutputMode::Mirror(dir) => dir.join(relative),
+        OutputMode::InPlace => temp_output_path(file),
     };
-    let output_file = output_dir.join(relative);
 
-    if let Some(parent) = output_file.parent()
-        && !parent.exists()
-    {
-        if let Err(err) = fs::create_dir_all(parent) {
-            eprintln!(
-                "{} Failed to create directory {}: {err}",
-                "ERROR:".red().bold(),
-                parent.display()
+    if let OutputMode::Mirror(dir) = output {
+        let output_file = dir.join(relative);
+        if let Some(parent) = output_file.parent()
+            && !parent.exists()
+        {
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "{} Failed to create directory {}: {err}",
+                    "ERROR:".red().bold(),
+                    parent.display()
+                );
+                return Outcome::Failed;
+            }
+            println!(
+                "{}",
+                format!("Created directory: {}", parent.display()).bright_black()
             );
-            return Outcome::Failed;
         }
-        println!(
-            "{}",
-            format!("Created directory: {}", parent.display()).bright_black()
-        );
+
+        if output_file.exists() {
+            println!("{}", "SKIPPED: Output file already exists".bright_black());
+            return Outcome::Skipped;
+        }
     }
 
-    if output_file.exists() {
-        println!("{}", "SKIPPED: Output file already exists".bright_black());
-        return Outcome::Skipped;
-    }
+    let crop: Option<String> = match source {
+        CropSource::Scan(Some(value)) => {
+            println!("{}", format!("Using scan result: crop={value}").green());
+            Some(value.clone())
+        }
+        CropSource::Scan(None) => None,
+        CropSource::Detect => {
+            println!("{}", "Detecting black bars...".cyan());
+            let detection = match detect_crop(file, encode.crop_detect_seconds) {
+                Ok(detection) => detection,
+                Err(err) => {
+                    eprintln!("{} {err:#}", "ERROR:".red().bold());
+                    return Outcome::Failed;
+                }
+            };
 
-    println!("{}", "Detecting black bars...".cyan());
-    let detection = match detect_crop(file, args.crop_detect_seconds) {
-        Ok(detection) => detection,
-        Err(err) => {
-            eprintln!("{} {err:#}", "ERROR:".red().bold());
-            return Outcome::Failed;
+            if detection.failed && detection.crop.is_none() {
+                eprintln!(
+                    "{}",
+                    "FAILED: FFmpeg returned an error during crop detection"
+                        .red()
+                        .bold()
+                );
+                detection.diagnostics.print();
+                return Outcome::Failed;
+            }
+
+            let is_full_frame = detection
+                .crop
+                .as_deref()
+                .zip(detection.source_size)
+                .is_some_and(|(crop, size)| is_full_frame(crop, size));
+
+            detection.crop.filter(|_| !is_full_frame)
         }
     };
 
-    if detection.failed && detection.crop.is_none() {
-        eprintln!(
-            "{}",
-            "FAILED: FFmpeg returned an error during crop detection"
-                .red()
-                .bold()
-        );
-        detection.diagnostics.print();
-        return Outcome::Failed;
-    }
+    let Some(crop) = crop else {
+        if in_place {
+            println!(
+                "{}",
+                "No black bars detected - nothing to do, file left as is".yellow()
+            );
+            return Outcome::Skipped;
+        }
+        if !encode.copy_uncropped {
+            println!(
+                "{}",
+                "No black bars detected - skipping (use --copy-uncropped to copy unchanged files)"
+                    .yellow()
+            );
+            return Outcome::Skipped;
+        }
 
-    let is_full_frame = detection
-        .crop
-        .as_deref()
-        .zip(detection.source_size)
-        .is_some_and(|(crop, size)| is_full_frame(crop, size));
-
-    let Some(crop) = detection.crop.filter(|_| !is_full_frame) else {
         println!("{}", "No black bars detected".yellow());
         println!("{}", "Copying file without modification...".cyan());
         return match fs::copy(file, &output_file) {
@@ -521,9 +966,25 @@ fn process_file(file: &Path, input_dir: &Path, output_dir: &Path, args: &Args) -
     println!("{}", format!("Detected: {crop_filter}").green());
     println!("{}", "Encoding with crop filter...".cyan());
 
-    match encode_video(file, &output_file, &crop_filter, args) {
+    match encode_video(file, &output_file, &crop_filter, encode) {
         Ok(true) => {
-            println!("{}", format!("SUCCESS: {}", relative.display()).green());
+            if in_place {
+                if let Err(err) = replace_file(&output_file, file) {
+                    eprintln!(
+                        "{} Failed to replace original {}: {err:#}",
+                        "ERROR:".red().bold(),
+                        file.display()
+                    );
+                    let _ = fs::remove_file(&output_file);
+                    return Outcome::Failed;
+                }
+                println!(
+                    "{}",
+                    format!("SUCCESS: {} (original replaced)", relative.display()).green()
+                );
+            } else {
+                println!("{}", format!("SUCCESS: {}", relative.display()).green());
+            }
             Outcome::Processed
         }
         Ok(false) => {
@@ -537,6 +998,39 @@ fn process_file(file: &Path, input_dir: &Path, output_dir: &Path, args: &Args) -
             Outcome::Failed
         }
     }
+}
+
+/// Temporary encode target for in-place processing: lives next to the
+/// original (same filesystem, so replacing it is a rename) and keeps the
+/// original's extension so ffmpeg picks the same muxer.
+fn temp_output_path(original: &Path) -> PathBuf {
+    let stem = original.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = original
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+    original.with_file_name(format!(
+        "{stem}.remove-bars-{}{extension}",
+        std::process::id()
+    ))
+}
+
+/// Replaces `original` with `replacement` via rename, falling back to
+/// copy-and-delete when the paths live on different filesystems.
+fn replace_file(replacement: &Path, original: &Path) -> color_eyre::Result<()> {
+    if fs::rename(replacement, original).is_ok() {
+        return Ok(());
+    }
+    fs::copy(replacement, original).wrap_err_with(|| {
+        format!(
+            "Failed to copy {} over {}",
+            replacement.display(),
+            original.display()
+        )
+    })?;
+    fs::remove_file(replacement)
+        .wrap_err_with(|| format!("Failed to remove {}", replacement.display()))?;
+    Ok(())
 }
 
 fn detect_crop(input: &Path, seconds: u64) -> color_eyre::Result<CropDetection> {
@@ -611,7 +1105,7 @@ fn encode_video(
     input: &Path,
     output: &Path,
     crop_filter: &str,
-    args: &Args,
+    encode: &EncodeArgs,
 ) -> color_eyre::Result<bool> {
     let mut command = FfmpegCommand::new();
     command
@@ -620,7 +1114,11 @@ fn encode_video(
         .input(input.to_string_lossy())
         .args(["-vf", crop_filter])
         .map("0")
-        .args(video_encoder_args(args.encoder, args.crf, &args.preset))
+        .args(video_encoder_args(
+            encode.encoder,
+            encode.crf,
+            &encode.preset,
+        ))
         .codec_audio("copy")
         .codec_subtitle("copy")
         .output(output.to_string_lossy());

@@ -14,7 +14,11 @@ For every video found under the input directory:
 3. If the detected crop equals the full frame (no bars present), the file is copied unchanged
 4. Otherwise the video is re-encoded with the crop applied (`libx264`, configurable CRF and preset, audio and subtitle streams stream-copied)
 
-The input directory structure is mirrored into the output directory. Original files are never modified, and files that already exist in the output directory are skipped, so the tool is safe to re-run.
+The input directory structure is mirrored into the output directory, and files
+that already exist in the output directory are skipped, so the tool is safe to
+re-run. Files that need no cropping are skipped as well unless
+`--copy-uncropped` is given. Original files are only modified with
+`--overwrite-original`.
 
 ## Requirements
 
@@ -45,22 +49,49 @@ This installs the `remove_bars` binary into `~/.cargo/bin`.
 
 ## Usage
 
+`remove_bars` has two subcommands: `scan` (index which videos need cropping
+into an SQLite database) and `crop` (crop videos in a directory, or videos
+indexed by a previous scan).
+
+### Scan
+
+Analyze every video under a directory and index the result into an SQLite
+database, without modifying any files:
+
 ```sh
-remove_bars --input ./videos --output ./cropped --crf 20 --preset slow
+remove_bars scan -i ./videos -o scan.sqlite
 ```
+
+The database records, for each video, its path relative to the scanned
+directory, the detected `crop=W:H:X:Y` value, the source resolution and
+whether it needs cropping. Re-running a scan replaces the previous database
+contents.
+
+### Crop
+
+```sh
+remove_bars crop -i ./videos -o ./cropped
+remove_bars crop -i scan.sqlite -o ./cropped --overwrite-original -e nvenc
+```
+
+`-i` accepts either a directory (crops are detected on the fly) or a scan
+database (the indexed crop values are reused, so detection is skipped). Files
+that were indexed but have since been moved or deleted are reported and
+skipped.
 
 ### Arguments
 
-| Option | Value | Default | Description |
-|--------|-------|---------|-------------|
-| `-i`, `--input` | `<DIR>` | `input` | Directory containing the videos to process |
-| `-o`, `--output` | `<DIR>` | `output` | Directory to write processed videos to |
-| `-s`, `--crop-detect-seconds` | `<SECONDS>` | `60` | Seconds of video to analyze, starting 30s into the file |
-| `-c`, `--crf` | `<CRF>` | `18` | Quality factor for the H.264 encode, 0–51 (lower = higher quality); translated per encoder, see [hardware acceleration](#hardware-acceleration) |
-| `-e`, `--encoder` | `<ENCODER>` | `x264` | Video encoder: `x264` (CPU), `nvenc` (NVIDIA), `amf` (AMD) or `qsv` (Intel) |
-| `-p`, `--preset` | `<PRESET>` | `medium` | x264-style encoding preset (`ultrafast` … `veryslow`); hardware encoders map it to their own presets |
-| `-h`, `--help` | | | Print help |
-| `-V`, `--version` | | | Print version |
+| Option | Value | Default | Description | Available in |
+|--------|-------|---------|-------------|--------------|
+| `-i`, `--input` | `<DIR>` / `<FILE>` | `input` | Directory of videos (or scan database for `crop`) | `scan`, `crop` |
+| `-o`, `--output` | `<FILE>` / `<DIR>` | `scan.sqlite` / `output` | SQLite database file (`scan`) or output directory (`crop`) | `scan`, `crop` |
+| `-s`, `--crop-detect-seconds` | `<SECONDS>` | `60` | Seconds of video to analyze, starting 30s into the file | `scan`, `crop` |
+| `-c`, `--crf` | `<CRF>` | `18` | Quality factor for the H.264 encode, 0–51 (lower = higher quality); translated per encoder, see [hardware acceleration](#hardware-acceleration) | `crop` |
+| `-e`, `--encoder` | `<ENCODER>` | `x264` | Video encoder: `x264` (CPU), `nvenc` (NVIDIA), `amf` (AMD) or `qsv` (Intel) | `crop` |
+| `-p`, `--preset` | `<PRESET>` | `medium` | x264-style encoding preset (`ultrafast` … `veryslow`); hardware encoders map it to their own presets | `crop` |
+| `--copy-uncropped` | | off | Copy files that need no cropping to the output directory | `crop` |
+| `--overwrite-original` | | off | Replace original files in-place after a successful encode | `crop` |
+| `-h`, `--help` | | | Print help | |
 
 ### Hardware acceleration
 
@@ -74,7 +105,7 @@ Encoding can be offloaded to the GPU with `-e` / `--encoder`:
 | `qsv` | h264_qsv | Intel (Quick Sync Video) |
 
 ```sh
-remove_bars -i ./videos -o ./cropped -e nvenc
+remove_bars crop -i ./videos -o ./cropped -e nvenc
 ```
 
 The quality factor (`-c`) is translated for each encoder: CRF for x264, CQ
