@@ -4,7 +4,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Parser, Subcommand};
@@ -523,20 +523,18 @@ fn run_scan(
         .build()
         .wrap_err("Failed to start scan thread pool")?;
 
+    let start = Instant::now();
     let bar = ProgressBar::new(total as u64);
     bar.set_style(
-        ProgressStyle::with_template(
-            "Scanning {msg} [{wide_bar:.cyan/blue}] {percent:>3}% {pos}/{len} eta {eta}",
-        )
-        .expect("progress bar template is valid")
-        .progress_chars("█░"),
+        ProgressStyle::with_template("{msg}\n{wide_bar:.cyan/blue}")
+            .expect("progress bar template is valid")
+            .progress_chars("█░"),
     );
+    bar.set_message(progress_label("Scanning", &scan_stats(0, total, start)));
 
     let mut needs_crop = 0;
     let mut no_crop = 0;
     let mut errors = 0;
-
-    let msg_width = progress_message_width();
 
     for chunk_start in (0..total).step_by(SCAN_BATCH_SIZE) {
         let chunk = &video_files[chunk_start..(chunk_start + SCAN_BATCH_SIZE).min(total)];
@@ -553,7 +551,7 @@ fn run_scan(
                         crop_detect_start,
                         crop_detect_seconds,
                         threshold,
-                        msg_width,
+                        start,
                         &bar,
                     )
                 })
@@ -598,22 +596,72 @@ fn run_scan(
     Ok(())
 }
 
-/// Pads or truncates text to a fixed display width (Unicode-aware): short
-/// text is padded with spaces, long text is truncated with an ellipsis.
-fn fixed_width(text: &str, width: usize) -> String {
-    console::pad_str(text, width, console::Alignment::Left, Some("…")).to_string()
+/// Formats the first line of a two-line progress bar: the label on the left
+/// and the statistics on the right, filling the gap so the line spans the
+/// terminal width. The label is truncated with an ellipsis when both parts
+/// cannot fit.
+fn progress_label(label: &str, stats: &str) -> String {
+    let width = console::Term::stderr()
+        .size_checked()
+        .map(|(_, columns)| columns as usize)
+        .unwrap_or(80);
+    let label_width = console::measure_text_width(label);
+    let stats_width = console::measure_text_width(stats);
+
+    if label_width + stats_width + 1 > width {
+        let max_label = width.saturating_sub(stats_width + 1).max(4);
+        let truncated = console::pad_str(label, max_label, console::Alignment::Left, Some("…"));
+        format!("{truncated} {stats}")
+    } else {
+        let gap = " ".repeat(width - label_width - stats_width - 1);
+        format!("{label}{gap} {stats}")
+    }
 }
 
-/// Fixed character width for file names in progress bar messages, derived
-/// from the terminal width so the bar and counters keep room on narrow
-/// terminals. Falls back to 32 when the terminal size is unknown.
-fn progress_message_width() -> usize {
-    const RESERVED: usize = 42;
-    const FALLBACK: usize = 32;
-    console::Term::stderr()
-        .size_checked()
-        .map(|(_, columns)| (columns as usize).saturating_sub(RESERVED).clamp(16, 48))
-        .unwrap_or(FALLBACK)
+/// Formats the remaining time as HH:MM:SS, estimated linearly from the
+/// elapsed time and progress so far. Returns a placeholder while no progress
+/// has been reported yet.
+fn eta_string(elapsed: Duration, position: u64, total: u64) -> String {
+    if position == 0 || total == 0 {
+        return "--:--".to_string();
+    }
+    let per_unit = elapsed.as_secs_f64() / position as f64;
+    let remaining = per_unit * total.saturating_sub(position) as f64;
+    let seconds = remaining.round() as u64;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+/// The right-hand statistics for the scan progress bar at a given number of
+/// completed files.
+fn scan_stats(completed: usize, total: usize, start: Instant) -> String {
+    let percent = if total == 0 {
+        100
+    } else {
+        completed * 100 / total
+    };
+    format!(
+        "{percent:>3}% {completed}/{total} eta {}",
+        eta_string(start.elapsed(), completed as u64, total as u64)
+    )
+}
+
+/// The right-hand statistics for the encode progress bar at a given frame
+/// position.
+fn encode_stats(position: u64, total: u64, start: Instant) -> String {
+    let percent = if total == 0 {
+        100
+    } else {
+        position.min(total) * 100 / total
+    };
+    format!(
+        "{percent:>3}% {position}/{total} frames eta {}",
+        eta_string(start.elapsed(), position, total)
+    )
 }
 
 /// Runs crop detection for a single file. Executed on the rayon pool; progress
@@ -627,7 +675,7 @@ fn scan_one(
     crop_detect_start: u64,
     crop_detect_seconds: u64,
     threshold: u32,
-    msg_width: usize,
+    start: Instant,
     bar: &ProgressBar,
 ) -> ScanRow {
     let name = file
@@ -635,7 +683,10 @@ fn scan_one(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    bar.set_message(fixed_width(&name, msg_width));
+    bar.set_message(progress_label(
+        &format!("Scanning {name}"),
+        &scan_stats(index - 1, total, start),
+    ));
 
     // indicatif drops lines printed through a hidden progress bar (piped
     // output), so fall back to plain stderr printing in that case.
@@ -738,6 +789,10 @@ fn scan_one(
     };
 
     bar.inc(1);
+    bar.set_message(progress_label(
+        &format!("Scanning {name}"),
+        &scan_stats(index, total, start),
+    ));
     row
 }
 
@@ -1320,6 +1375,7 @@ fn encode_video(
         .wrap_err("Failed to start ffmpeg for encoding")?;
 
     let mut capture = LogCapture::new(10);
+    let start = Instant::now();
     let mut duration_secs: Option<f64> = None;
     let mut fps: Option<f32> = None;
     let mut bar: Option<ProgressBar> = None;
@@ -1341,16 +1397,31 @@ fn encode_video(
                 }
             }
             FfmpegEvent::Progress(progress) => {
+                let position = progress.frame as u64;
                 let bar = bar.get_or_insert_with(|| {
-                    create_progress_bar(&file_name, estimated_total_frames(duration_secs, fps))
+                    create_progress_bar(
+                        &file_name,
+                        estimated_total_frames(duration_secs, fps),
+                        start,
+                    )
                 });
-                bar.set_position(progress.frame as u64);
-                let name = fixed_width(&file_name, progress_message_width());
-                bar.set_message(if progress.fps > 0.0 {
-                    format!("{name} ({:.2}x, {:.0} fps)", progress.speed, progress.fps)
+                bar.set_position(position);
+
+                let label = if progress.fps > 0.0 {
+                    format!(
+                        "Encoding {file_name} ({:.2}x, {:.0} fps)",
+                        progress.speed, progress.fps
+                    )
                 } else {
-                    format!("{name} ({:.2}x)", progress.speed)
-                });
+                    format!("Encoding {file_name} ({:.2}x)", progress.speed)
+                };
+                let message = match bar.length() {
+                    Some(total) if total > 0 => {
+                        progress_label(&label, &encode_stats(position, total, start))
+                    }
+                    _ => label,
+                };
+                bar.set_message(message);
             }
             FfmpegEvent::Log(level, line) => {
                 if matches!(level, LogLevel::Error | LogLevel::Fatal) {
@@ -1388,27 +1459,26 @@ fn estimated_total_frames(duration_secs: Option<f64>, fps: Option<f32>) -> Optio
     (total > 0.0).then(|| total.round() as u64)
 }
 
-fn create_progress_bar(file_name: &str, total_frames: Option<u64>) -> ProgressBar {
+fn create_progress_bar(file_name: &str, total_frames: Option<u64>, start: Instant) -> ProgressBar {
+    let label = format!("Encoding {file_name}");
     match total_frames {
         Some(total) => {
             let bar = ProgressBar::new(total);
             bar.set_style(
-                ProgressStyle::with_template(
-                    "Encoding {msg} [{wide_bar:.cyan/blue}] {percent:>3}% {pos}/{len} frames eta {eta}",
-                )
-                .expect("progress bar template is valid")
-                .progress_chars("█░"),
+                ProgressStyle::with_template("{msg}\n{wide_bar:.cyan/blue}")
+                    .expect("progress bar template is valid")
+                    .progress_chars("█░"),
             );
-            bar.set_message(file_name.to_string());
+            bar.set_message(progress_label(&label, &encode_stats(0, total, start)));
             bar
         }
         None => {
             let bar = ProgressBar::new_spinner();
             bar.set_style(
-                ProgressStyle::with_template("Encoding {msg} {pos} frames")
+                ProgressStyle::with_template("{msg}\n{spinner} {pos} frames")
                     .expect("progress bar template is valid"),
             );
-            bar.set_message(file_name.to_string());
+            bar.set_message(label);
             bar.enable_steady_tick(std::time::Duration::from_millis(200));
             bar
         }
@@ -1506,27 +1576,30 @@ mod tests {
     }
 
     #[test]
-    fn fixed_width_pads_short_text() {
-        assert_eq!(fixed_width("ab", 5), "ab   ");
+    fn progress_label_spans_the_terminal_width() {
+        let line = progress_label("Scanning a.mkv", "  0% 0/2 eta 00:00:10");
+        assert_eq!(console::measure_text_width(&line), 80);
+        assert!(line.starts_with("Scanning a.mkv"));
+        assert!(line.ends_with("  0% 0/2 eta 00:00:10"));
     }
 
     #[test]
-    fn fixed_width_keeps_exact_fits() {
-        assert_eq!(fixed_width("abcde", 5), "abcde");
+    fn progress_label_truncates_long_labels() {
+        let label = format!("Scanning {}", "x".repeat(200));
+        let stats = "100% 1/1 eta 00:00:00";
+        let line = progress_label(&label, stats);
+        assert_eq!(console::measure_text_width(&line), 80);
+        assert!(line.contains('…'), "long label should end with an ellipsis");
+        assert!(line.ends_with(stats));
     }
 
     #[test]
-    fn fixed_width_truncates_with_ellipsis() {
-        let result = fixed_width("abcdefgh", 5);
-        assert_eq!(result, "abcd…");
-        assert_eq!(console::measure_text_width(&result), 5);
-    }
-
-    #[test]
-    fn fixed_width_is_display_width_aware() {
-        // CJK characters occupy two terminal columns each.
-        let result = fixed_width("日本語テスト", 5);
-        assert_eq!(console::measure_text_width(&result), 5);
+    fn eta_string_estimates_linearly_from_rate() {
+        assert_eq!(eta_string(Duration::from_secs(10), 10, 100), "00:01:30");
+        assert_eq!(eta_string(Duration::from_secs(0), 10, 100), "00:00:00");
+        assert_eq!(eta_string(Duration::from_secs(5), 100, 100), "00:00:00");
+        assert_eq!(eta_string(Duration::from_secs(5), 0, 100), "--:--");
+        assert_eq!(eta_string(Duration::from_secs(5), 10, 0), "--:--");
     }
 
     #[test]
