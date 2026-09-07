@@ -17,7 +17,7 @@ use ffmpeg_sidecar::{
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::Regex;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, params};
 use walkdir::WalkDir;
 
 /// Video encoder to use for the re-encode step.
@@ -508,7 +508,8 @@ fn run_scan(
                  height     INTEGER,
                  needs_crop INTEGER NOT NULL,
                  status     TEXT NOT NULL,
-                 scanned_at INTEGER NOT NULL
+                 scanned_at INTEGER NOT NULL,
+                 cropped_at INTEGER
              );",
         )
         .wrap_err("Failed to initialize scan database schema")?;
@@ -825,29 +826,59 @@ struct ScanEntry {
     width: Option<u32>,
     height: Option<u32>,
     needs_crop: bool,
+    cropped_at: Option<i64>,
+}
+
+/// Opens a scan database for cropping, upgrading the schema in place when it
+/// was created by an older version without progress tracking.
+fn open_scan_db(db_path: &Path) -> color_eyre::Result<Connection> {
+    let connection = Connection::open(db_path)
+        .with_context(|| format!("Failed to open scan database: {}", db_path.display()))?;
+
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('videos', 'meta')",
+            [],
+            |row| row.get(0),
+        )
+        .wrap_err("Failed to inspect scan database")?;
+    if tables < 2 {
+        bail!("{} is not a remove_bars scan database", db_path.display());
+    }
+
+    let columns: Vec<String> = connection
+        .prepare("PRAGMA table_info(videos)")
+        .wrap_err("Failed to inspect scan database")?
+        .query_map([], |row| row.get(1))
+        .wrap_err("Failed to inspect scan database")?
+        .collect::<Result<_, _>>()
+        .wrap_err("Failed to inspect scan database")?;
+    if !columns.iter().any(|column| column == "cropped_at") {
+        connection
+            .execute("ALTER TABLE videos ADD COLUMN cropped_at INTEGER", [])
+            .wrap_err("Failed to upgrade scan database schema")?;
+    }
+
+    Ok(connection)
 }
 
 /// Reads the indexed videos and the scanned input root from a scan database.
-fn read_scan_db(db_path: &Path) -> color_eyre::Result<(PathBuf, Vec<ScanEntry>)> {
-    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open scan database: {}", db_path.display()))?;
-
+fn read_scan_index(connection: &Connection) -> color_eyre::Result<(PathBuf, Vec<ScanEntry>)> {
     let input_root: String = connection
         .query_row(
             "SELECT value FROM meta WHERE key = 'input_root'",
             [],
             |row| row.get(0),
         )
-        .with_context(|| {
-            format!(
-                "Scan database has no input root; was {} created by 'remove_bars scan'?",
-                db_path.display()
-            )
-        })?;
+        .with_context(
+            || "Scan database has no input root; was it created by 'remove_bars scan'?",
+        )?;
 
     let mut statement = connection
-        .prepare("SELECT path, crop, width, height, needs_crop FROM videos ORDER BY path")
-        .with_context(|| format!("Failed to read scan database: {}", db_path.display()))?;
+        .prepare(
+            "SELECT path, crop, width, height, needs_crop, cropped_at FROM videos ORDER BY path",
+        )
+        .with_context(|| "Failed to read scan database")?;
     let entries = statement
         .query_map([], |row| {
             Ok(ScanEntry {
@@ -856,6 +887,7 @@ fn read_scan_db(db_path: &Path) -> color_eyre::Result<(PathBuf, Vec<ScanEntry>)>
                 width: row.get(2)?,
                 height: row.get(3)?,
                 needs_crop: row.get::<_, i64>(4)? != 0,
+                cropped_at: row.get(5)?,
             })
         })
         .wrap_err("Failed to read scan database")?
@@ -879,9 +911,14 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
         file: PathBuf,
         relative: PathBuf,
         source: CropSource,
+        /// Set when the job came from a scan database, so successful crops can
+        /// be recorded for resume support.
+        index_path: Option<String>,
     }
 
     let mut jobs: Vec<CropJob> = Vec::new();
+    let mut db_connection: Option<Connection> = None;
+    let mut already_cropped = 0;
 
     print_header();
     if input.is_dir() {
@@ -901,13 +938,16 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
                 file,
                 relative,
                 source: CropSource::Detect,
+                index_path: None,
             });
         }
     } else if input.is_file() {
         if !input.exists() {
             bail!("Scan database not found: {}", input.display());
         }
-        let (input_root, entries) = read_scan_db(&input)?;
+        let connection = open_scan_db(&input)?;
+        let (input_root, entries) = read_scan_index(&connection)?;
+        db_connection = Some(connection);
         let input_root = input_root.canonicalize().with_context(|| {
             format!(
                 "Scanned input root no longer exists: {}",
@@ -917,15 +957,30 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
         println!("Scan:   {}", input.display());
         println!("Input:  {}", input_root.display());
         print_output_target(&output_mode);
+
         let needs_crop = entries.iter().filter(|entry| entry.needs_crop).count();
+        already_cropped = entries
+            .iter()
+            .filter(|entry| entry.cropped_at.is_some())
+            .count();
         println!(
             "Indexed {} video file(s), {} need cropping",
             entries.len(),
             needs_crop
         );
+        if already_cropped > 0 {
+            println!(
+                "Resuming: {} file(s) already cropped and will be skipped",
+                already_cropped
+            );
+        }
         println!("{}", "========================================".cyan());
 
         for entry in entries {
+            if entry.cropped_at.is_some() {
+                continue;
+            }
+
             let source = if entry.needs_crop {
                 match &entry.crop {
                     // Re-apply the threshold at crop time so it can be more
@@ -948,6 +1003,7 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
                 file: input_root.join(&entry.path),
                 relative: PathBuf::from(&entry.path),
                 source,
+                index_path: Some(entry.path),
             });
         }
     } else if !input.exists() {
@@ -960,12 +1016,23 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
     }
 
     if jobs.is_empty() {
-        println!("{} No video files found", "WARNING:".yellow());
+        if already_cropped > 0 {
+            println!(
+                "{} All indexed file(s) have already been cropped",
+                "NOTE:".cyan()
+            );
+        } else {
+            println!("{} No video files found", "WARNING:".yellow());
+        }
         return Ok(());
     }
 
     let total = jobs.len();
     let (mut processed, mut skipped, mut failed) = (0, 0, 0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
 
     for (index, job) in jobs.iter().enumerate() {
         println!();
@@ -996,7 +1063,28 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
             continue;
         }
 
-        match process_file(&job.file, &job.relative, &output_mode, &encode, &job.source) {
+        let outcome = process_file(&job.file, &job.relative, &output_mode, &encode, &job.source);
+
+        // Record successful crops in the scan database so an interrupted run
+        // can resume where it left off. Files that were only copied or
+        // skipped are not recorded, so changing --copy-uncropped between
+        // runs still applies to them.
+        if matches!(outcome, Outcome::Processed)
+            && !matches!(job.source, CropSource::Scan(None))
+            && let (Some(connection), Some(path)) = (&db_connection, &job.index_path)
+        {
+            if let Err(err) = connection.execute(
+                "UPDATE videos SET cropped_at = ?1 WHERE path = ?2 AND cropped_at IS NULL",
+                params![now, path],
+            ) {
+                eprintln!(
+                    "{} Failed to record progress for {path}: {err:#}",
+                    "WARNING:".yellow()
+                );
+            }
+        }
+
+        match outcome {
             Outcome::Processed => processed += 1,
             Outcome::Skipped => skipped += 1,
             Outcome::Failed => failed += 1,

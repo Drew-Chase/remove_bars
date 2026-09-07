@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Added
+
+- Resumable cropping: when cropping from a scan database, each successfully
+  cropped file is recorded in the database. Re-running the same command skips
+  files that were already cropped and continues where the previous run left
+  off, so long jobs can be stopped and resumed. Failed files are retried on
+  the next run, and scan databases created by older versions are upgraded in
+  place.
+
 ## 1.0.0 - 2026-09-06
 
 ### Added

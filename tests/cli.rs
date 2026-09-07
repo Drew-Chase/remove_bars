@@ -85,6 +85,28 @@ fn count_database_rows(db: &Path, needs_crop: bool) -> usize {
         .unwrap() as usize
 }
 
+fn mark_cropped(db: &Path, path_suffix: &str) {
+    let connection = Connection::open(db).unwrap();
+    connection
+        .execute(
+            "UPDATE videos SET cropped_at = 1 WHERE path LIKE '%' || ?1",
+            [path_suffix],
+        )
+        .unwrap();
+}
+
+fn is_marked_cropped(db: &Path, path_suffix: &str) -> bool {
+    let connection = Connection::open(db).unwrap();
+    connection
+        .query_row(
+            "SELECT cropped_at FROM videos WHERE path LIKE '%' || ?1",
+            [path_suffix],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+        .is_some()
+}
+
 fn read_crop_for(db: &Path, path_suffix: &str) -> (Option<String>, bool, String) {
     let connection = Connection::open(db).unwrap();
     connection
@@ -630,6 +652,131 @@ fn crop_fails_cleanly_on_missing_database() {
     assert!(
         stderr.contains("Input path does not exist"),
         "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn crop_records_progress_in_the_scan_database() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_letterboxed_video(&input_dir, "video.mkv", false);
+    let db = temp.path().join("scan.sqlite");
+    run_scan(&input_dir, &db);
+    assert!(!is_marked_cropped(&db, "video.mkv"));
+    let output_dir = temp.path().join("output");
+
+    run_tool(&db, &output_dir);
+
+    assert!(
+        is_marked_cropped(&db, "video.mkv"),
+        "successful crops should be recorded in the database"
+    );
+}
+
+#[test]
+fn crop_from_database_resumes_where_it_left_off() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_letterboxed_video(&input_dir, "a-first.mkv", false);
+    create_letterboxed_video(&input_dir, "b-second.mkv", false);
+    let db = temp.path().join("scan.sqlite");
+    run_scan(&input_dir, &db);
+
+    // Simulate a previous run that finished the first file before stopping.
+    mark_cropped(&db, "a-first.mkv");
+    let output_dir = temp.path().join("output");
+
+    let log = run_tool(&db, &output_dir);
+
+    assert!(
+        log.contains("Resuming: 1 file(s) already cropped and will be skipped"),
+        "log:\n{log}"
+    );
+    assert!(
+        log.contains("SUCCESS: b-second.mkv"),
+        "the unprocessed file should be cropped:\n{log}"
+    );
+    assert!(
+        !output_dir.join("a-first.mkv").exists(),
+        "already-cropped files must not be re-encoded"
+    );
+    assert_eq!(
+        probe_video_size(&output_dir.join("b-second.mkv")),
+        (320, 176)
+    );
+
+    assert!(is_marked_cropped(&db, "b-second.mkv"));
+
+    // A further run has nothing left to do and exits before the summary.
+    let log = run_tool(&db, &output_dir);
+    assert!(
+        log.contains("All indexed file(s) have already been cropped"),
+        "log:\n{log}"
+    );
+    assert!(
+        !log.contains("PROCESSING COMPLETE"),
+        "nothing to do should exit before the summary:\n{log}"
+    );
+}
+
+#[test]
+fn crop_upgrades_databases_without_progress_tracking() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_letterboxed_video(&input_dir, "video.mkv", false);
+    let db = temp.path().join("scan.sqlite");
+
+    // Build a database with the pre-1.0 schema (no cropped_at column).
+    let root = fs::canonicalize(&input_dir).unwrap();
+    let connection = Connection::open(&db).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE videos (
+                 path       TEXT PRIMARY KEY,
+                 crop       TEXT,
+                 width      INTEGER,
+                 height     INTEGER,
+                 needs_crop INTEGER NOT NULL,
+                 status     TEXT NOT NULL,
+                 scanned_at INTEGER NOT NULL
+             );
+             INSERT INTO meta (key, value) VALUES ('input_root', 'placeholder');
+             INSERT INTO videos (path, crop, width, height, needs_crop, status, scanned_at)
+             VALUES ('video.mkv', '320:176:0:32', 320, 240, 1, 'scanned', 0);",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'input_root'",
+            [root.to_string_lossy().to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let output_dir = temp.path().join("output");
+    let log = run_tool(&db, &output_dir);
+
+    assert!(log.contains("SUCCESS"), "log:\n{log}");
+    assert_eq!(probe_video_size(&output_dir.join("video.mkv")), (320, 176));
+    assert!(
+        is_marked_cropped(&db, "video.mkv"),
+        "the upgraded database should track progress"
     );
 }
 

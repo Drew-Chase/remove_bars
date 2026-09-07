@@ -85,6 +85,12 @@ database (the indexed crop values are reused, so detection is skipped). Files
 that were indexed but have since been moved or deleted are reported and
 skipped.
 
+Cropping from a scan database is **resumable**: each successfully cropped file
+is recorded in the database, so an interrupted run can simply be re-run —
+already-cropped files are skipped and the rest continue where they left off.
+Failed files are retried. Re-scanning replaces the database contents and
+resets progress.
+
 ### Arguments
 
 | Option | Value | Default | Description | Available in |
