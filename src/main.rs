@@ -73,7 +73,11 @@ enum Command {
         #[arg(short, long, default_value = "scan.sqlite")]
         output: PathBuf,
 
-        /// Seconds of video to analyze, starting 30s into the file
+        /// Seconds into the video to start crop detection
+        #[arg(long, default_value_t = 30)]
+        crop_detect_start: u64,
+
+        /// Seconds of video to analyze, starting at --crop-detect-start
         #[arg(short = 's', long, default_value_t = 60)]
         crop_detect_seconds: u64,
     },
@@ -96,7 +100,11 @@ enum Command {
 /// Options that control how videos are cropped and encoded.
 #[derive(clap::Args, Debug)]
 struct EncodeArgs {
-    /// Seconds of video to analyze, starting 30s into the file
+    /// Seconds into the video to start crop detection
+    #[arg(long, default_value_t = 30)]
+    crop_detect_start: u64,
+
+    /// Seconds of video to analyze, starting at --crop-detect-start
     #[arg(short = 's', long, default_value_t = 60)]
     crop_detect_seconds: u64,
 
@@ -126,8 +134,6 @@ struct EncodeArgs {
 }
 
 const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "mov", "wmv", "m4v", "webm"];
-
-const CROP_DETECT_START_SECS: u64 = 30;
 
 const CROP_DETECT_FILTER: &str = "cropdetect=24:16:0";
 
@@ -355,8 +361,9 @@ fn main() -> color_eyre::Result<()> {
         Command::Scan {
             input,
             output,
+            crop_detect_start,
             crop_detect_seconds,
-        } => run_scan(input, output, crop_detect_seconds),
+        } => run_scan(input, output, crop_detect_start, crop_detect_seconds),
         Command::Crop {
             input,
             output,
@@ -389,7 +396,12 @@ fn print_summary(processed: usize, skipped: usize, failed: usize, total: usize) 
     println!("Total:     {total}");
 }
 
-fn run_scan(input: PathBuf, output: PathBuf, crop_detect_seconds: u64) -> color_eyre::Result<()> {
+fn run_scan(
+    input: PathBuf,
+    output: PathBuf,
+    crop_detect_start: u64,
+    crop_detect_seconds: u64,
+) -> color_eyre::Result<()> {
     ensure_ffmpeg()?;
 
     let input_dir = resolve_existing_dir(&input, "Input")?;
@@ -465,7 +477,7 @@ fn run_scan(input: PathBuf, output: PathBuf, crop_detect_seconds: u64) -> color_
             }
         };
 
-        let detection = match detect_crop(file, crop_detect_seconds) {
+        let detection = match detect_crop(file, crop_detect_start, crop_detect_seconds) {
             Ok(detection) => detection,
             Err(err) => {
                 eprintln!("{} {err:#}", "ERROR:".red().bold());
@@ -902,13 +914,14 @@ fn process_file(
         CropSource::Scan(None) => None,
         CropSource::Detect => {
             println!("{}", "Detecting black bars...".cyan());
-            let detection = match detect_crop(file, encode.crop_detect_seconds) {
-                Ok(detection) => detection,
-                Err(err) => {
-                    eprintln!("{} {err:#}", "ERROR:".red().bold());
-                    return Outcome::Failed;
-                }
-            };
+            let detection =
+                match detect_crop(file, encode.crop_detect_start, encode.crop_detect_seconds) {
+                    Ok(detection) => detection,
+                    Err(err) => {
+                        eprintln!("{} {err:#}", "ERROR:".red().bold());
+                        return Outcome::Failed;
+                    }
+                };
 
             if detection.failed && detection.crop.is_none() {
                 eprintln!(
@@ -1033,7 +1046,7 @@ fn replace_file(replacement: &Path, original: &Path) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn detect_crop(input: &Path, seconds: u64) -> color_eyre::Result<CropDetection> {
+fn detect_crop(input: &Path, start: u64, seconds: u64) -> color_eyre::Result<CropDetection> {
     let mut capture = LogCapture::new(10);
     let mut crop_counter = CropCounter::new();
     let mut source_size: Option<(u32, u32)> = None;
@@ -1041,7 +1054,7 @@ fn detect_crop(input: &Path, seconds: u64) -> color_eyre::Result<CropDetection> 
     let mut command = FfmpegCommand::new();
     command
         .hide_banner()
-        .args(["-ss", &CROP_DETECT_START_SECS.to_string()])
+        .args(["-ss", &start.to_string()])
         .input(input.to_string_lossy())
         .args(["-t", &seconds.to_string()])
         // `-vf` (and not sidecar's `.filter()`, which emits `-filter`) is

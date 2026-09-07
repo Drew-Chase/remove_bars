@@ -46,6 +46,10 @@ fn run_tool_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
 }
 
 fn run_scan(input: &Path, output: &Path) -> String {
+    run_scan_with(input, output, &[])
+}
+
+fn run_scan_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
     let result = Command::new(TOOL)
         .args([
             "scan",
@@ -54,6 +58,7 @@ fn run_scan(input: &Path, output: &Path) -> String {
             "-o",
             output.to_str().unwrap(),
         ])
+        .args(extra_args)
         .output()
         .expect("failed to run remove_bars scan");
 
@@ -162,6 +167,45 @@ fn create_full_frame_video(dir: &Path, name: &str) -> PathBuf {
             "-i",
             "testsrc=size=320x240:duration=35:rate=25",
         ])
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&output)
+        .status()
+        .expect("failed to run ffmpeg");
+    assert!(status.success(), "ffmpeg failed to create test fixture");
+
+    output
+}
+
+/// Creates a 75s video that is full-frame for the first 40 seconds and
+/// letterboxed (320x180 content padded into 320x240) for the last 35 seconds.
+fn create_mixed_video(dir: &Path, name: &str) -> PathBuf {
+    let output = dir.join(name);
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:duration=40:rate=25",
+        ])
+        .args([
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x180:duration=35:rate=25",
+        ])
+        .args([
+            "-filter_complex",
+            "[1:v]pad=320:240:0:30[b];[0:v][b]concat=n=2:v=1:a=0[out]",
+        ])
+        .args(["-map", "[out]"])
         .args([
             "-c:v",
             "libx264",
@@ -587,6 +631,41 @@ fn crop_fails_cleanly_on_missing_database() {
         stderr.contains("Input path does not exist"),
         "stderr:\n{stderr}"
     );
+}
+
+#[test]
+fn crop_detect_start_controls_detection_window() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_mixed_video(&input_dir, "mixed.mkv");
+
+    // A window inside the letterboxed second half (starts at 40s) needs
+    // cropping.
+    let db = temp.path().join("late.sqlite");
+    run_scan_with(
+        &input_dir,
+        &db,
+        &["--crop-detect-start", "45", "--crop-detect-seconds", "10"],
+    );
+    let (crop, needs_crop, _) = read_crop_for(&db, "mixed.mkv");
+    assert_eq!(crop.as_deref(), Some("320:176:0:32"));
+    assert!(needs_crop);
+
+    // A window inside the full-frame first half does not.
+    let db = temp.path().join("early.sqlite");
+    run_scan_with(
+        &input_dir,
+        &db,
+        &["--crop-detect-start", "5", "--crop-detect-seconds", "10"],
+    );
+    let (crop, needs_crop, _) = read_crop_for(&db, "mixed.mkv");
+    assert_eq!(crop.as_deref(), Some("320:240:0:0"));
+    assert!(!needs_crop);
 }
 
 #[test]

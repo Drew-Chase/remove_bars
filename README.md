@@ -85,7 +85,8 @@ skipped.
 |--------|-------|---------|-------------|--------------|
 | `-i`, `--input` | `<DIR>` / `<FILE>` | `input` | Directory of videos (or scan database for `crop`) | `scan`, `crop` |
 | `-o`, `--output` | `<FILE>` / `<DIR>` | `scan.sqlite` / `output` | SQLite database file (`scan`) or output directory (`crop`) | `scan`, `crop` |
-| `-s`, `--crop-detect-seconds` | `<SECONDS>` | `60` | Seconds of video to analyze, starting 30s into the file | `scan`, `crop` |
+| `-s`, `--crop-detect-seconds` | `<SECONDS>` | `60` | Seconds of video to analyze, starting at `--crop-detect-start` | `scan`, `crop` |
+| `--crop-detect-start` | `<SECONDS>` | `30` | Seconds into the video where crop detection starts | `scan`, `crop` |
 | `-c`, `--crf` | `<CRF>` | `18` | Quality factor for the H.264 encode, 0–51 (lower = higher quality); translated per encoder, see [hardware acceleration](#hardware-acceleration) | `crop` |
 | `-e`, `--encoder` | `<ENCODER>` | `x264` | Video encoder: `x264` (CPU), `nvenc` (NVIDIA), `amf` (AMD) or `qsv` (Intel) | `crop` |
 | `-p`, `--preset` | `<PRESET>` | `medium` | x264-style encoding preset (`ultrafast` … `veryslow`); hardware encoders map it to their own presets | `crop` |

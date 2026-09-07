@@ -6,6 +6,9 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `--crop-detect-start` option for `scan` and `crop`: chooses where crop
+  detection starts in each video (default 30s), used together with
+  `--crop-detect-seconds` to control the analyzed window.
 - `scan` subcommand: analyzes every video under a directory with cropdetect
   and indexes the results (relative path, detected crop value, source
   resolution, whether cropping is needed) into an SQLite database, without
