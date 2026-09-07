@@ -59,13 +59,19 @@ Analyze every video under a directory and index the result into an SQLite
 database, without modifying any files:
 
 ```sh
-remove_bars scan -i ./videos -o scan.sqlite
+remove_bars scan -i ./videos -o scan.sqlite -j 8
 ```
 
-The database records, for each video, its path relative to the scanned
-directory, the detected `crop=W:H:X:Y` value, the source resolution and
-whether it needs cropping. Re-running a scan replaces the previous database
-contents.
+Detection runs in parallel (`-j` / `--parallel`, defaulting to the number of
+CPU cores); results are buffered in memory and written to the database in
+batches. The database records, for each video, its path relative to the
+scanned directory, the detected `crop=W:H:X:Y` value, the source resolution
+and whether it needs cropping. Re-running a scan replaces the previous
+database contents.
+
+A `--threshold` (in pixels, default 8) ignores crops that only trim a few
+pixels from the frame edges — typically round-to-16 artifacts — so thin
+detection noise does not trigger pointless re-encodes.
 
 ### Crop
 
@@ -85,8 +91,10 @@ skipped.
 |--------|-------|---------|-------------|--------------|
 | `-i`, `--input` | `<DIR>` / `<FILE>` | `input` | Directory of videos (or scan database for `crop`) | `scan`, `crop` |
 | `-o`, `--output` | `<FILE>` / `<DIR>` | `scan.sqlite` / `output` | SQLite database file (`scan`) or output directory (`crop`) | `scan`, `crop` |
+| `-j`, `--parallel` | `<N>` | CPU count | Number of videos to scan in parallel | `scan` |
 | `-s`, `--crop-detect-seconds` | `<SECONDS>` | `60` | Seconds of video to analyze, starting at `--crop-detect-start` | `scan`, `crop` |
 | `--crop-detect-start` | `<SECONDS>` | `30` | Seconds into the video where crop detection starts | `scan`, `crop` |
+| `--threshold` | `<PIXELS>` | `8` | Ignore detected crops that trim at most this many pixels from any edge | `scan`, `crop` |
 | `-c`, `--crf` | `<CRF>` | `18` | Quality factor for the H.264 encode, 0–51 (lower = higher quality); translated per encoder, see [hardware acceleration](#hardware-acceleration) | `crop` |
 | `-e`, `--encoder` | `<ENCODER>` | `x264` | Video encoder: `x264` (CPU), `nvenc` (NVIDIA), `amf` (AMD) or `qsv` (Intel) | `crop` |
 | `-p`, `--preset` | `<PRESET>` | `medium` | x264-style encoding preset (`ultrafast` … `veryslow`); hardware encoders map it to their own presets | `crop` |
@@ -118,7 +126,9 @@ are passed through as-is.
 
 If the selected encoder is not compiled into the installed ffmpeg build, the
 tool exits before processing any files. A missing GPU or driver surfaces as an
-ffmpeg error when the first file is encoded.
+ffmpeg error when the first file is encoded. The `--threshold` option also
+applies when cropping from a scan database, so a higher value than the scan's
+can still skip files.
 
 ### Example output
 

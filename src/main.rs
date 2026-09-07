@@ -15,6 +15,7 @@ use ffmpeg_sidecar::{
     event::{FfmpegEvent, LogLevel},
 };
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::{Connection, OpenFlags, params};
 use walkdir::WalkDir;
@@ -73,6 +74,10 @@ enum Command {
         #[arg(short, long, default_value = "scan.sqlite")]
         output: PathBuf,
 
+        /// Number of videos to scan in parallel
+        #[arg(short = 'j', long, default_value_t = available_parallelism())]
+        parallel: usize,
+
         /// Seconds into the video to start crop detection
         #[arg(long, default_value_t = 30)]
         crop_detect_start: u64,
@@ -80,6 +85,11 @@ enum Command {
         /// Seconds of video to analyze, starting at --crop-detect-start
         #[arg(short = 's', long, default_value_t = 60)]
         crop_detect_seconds: u64,
+
+        /// Ignore detected crops that trim at most this many pixels from any
+        /// edge of the frame
+        #[arg(long, default_value_t = 8)]
+        threshold: u32,
     },
 
     /// Crop videos in a directory, or videos indexed by a previous scan
@@ -103,6 +113,11 @@ struct EncodeArgs {
     /// Seconds into the video to start crop detection
     #[arg(long, default_value_t = 30)]
     crop_detect_start: u64,
+
+    /// Ignore detected crops that trim at most this many pixels from any
+    /// edge of the frame
+    #[arg(long, default_value_t = 8)]
+    threshold: u32,
 
     /// Seconds of video to analyze, starting at --crop-detect-start
     #[arg(short = 's', long, default_value_t = 60)]
@@ -276,8 +291,31 @@ fn select_crop(values: &[(String, u32)]) -> Option<String> {
     best.map(|(index, _)| values[index].0.clone())
 }
 
-fn is_full_frame(crop: &str, size: (u32, u32)) -> bool {
-    crop == format!("{}:{}:0:0", size.0, size.1)
+/// Returns true when the detected crop trims at most `threshold` pixels from
+/// every edge of the source frame, i.e. the black bars are negligible. A
+/// threshold of 0 only accepts crops identical to the full frame.
+fn is_within_threshold(crop: &str, size: (u32, u32), threshold: u32) -> bool {
+    let values: Vec<u32> = crop
+        .split(':')
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    let [width, height, x, y] = values[..] else {
+        return false;
+    };
+    if width > size.0 || height > size.1 {
+        return false;
+    }
+    let left = x;
+    let right = size.0.saturating_sub(x + width);
+    let top = y;
+    let bottom = size.1.saturating_sub(y + height);
+    left.max(right).max(top).max(bottom) <= threshold
+}
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
 }
 
 /// Builds the ffmpeg output arguments for the video encoder, translating the
@@ -361,9 +399,18 @@ fn main() -> color_eyre::Result<()> {
         Command::Scan {
             input,
             output,
+            parallel,
             crop_detect_start,
             crop_detect_seconds,
-        } => run_scan(input, output, crop_detect_start, crop_detect_seconds),
+            threshold,
+        } => run_scan(
+            input,
+            output,
+            parallel,
+            crop_detect_start,
+            crop_detect_seconds,
+            threshold,
+        ),
         Command::Crop {
             input,
             output,
@@ -396,11 +443,28 @@ fn print_summary(processed: usize, skipped: usize, failed: usize, total: usize) 
     println!("Total:     {total}");
 }
 
+/// A single file's scan result, buffered in memory and dumped to the scan
+/// database in batches.
+struct ScanRow {
+    path: String,
+    crop: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    needs_crop: bool,
+    status: &'static str,
+}
+
+/// Number of scan results buffered in memory before they are dumped to the
+/// SQLite database in a single transaction.
+const SCAN_BATCH_SIZE: usize = 100;
+
 fn run_scan(
     input: PathBuf,
     output: PathBuf,
+    parallel: usize,
     crop_detect_start: u64,
     crop_detect_seconds: u64,
+    threshold: u32,
 ) -> color_eyre::Result<()> {
     ensure_ffmpeg()?;
 
@@ -411,6 +475,11 @@ fn run_scan(
     print_header();
     println!("Input:    {}", input_dir.display());
     println!("Database: {}", output.display());
+    println!(
+        "Parallel: {parallel} | Window: {}s..{}s | Threshold: {threshold}px",
+        crop_detect_start,
+        crop_detect_start + crop_detect_seconds
+    );
     println!("Found {total} video file(s) to scan");
     println!("{}", "========================================".cyan());
 
@@ -422,7 +491,7 @@ fn run_scan(
             .wrap_err_with(|| format!("Failed to create directory: {}", parent.display()))?;
     }
 
-    let connection = Connection::open(&output)
+    let mut connection = Connection::open(&output)
         .with_context(|| format!("Failed to open scan database: {}", output.display()))?;
     connection
         .execute_batch(
@@ -449,114 +518,62 @@ fn run_scan(
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
 
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(parallel)
+        .build()
+        .wrap_err("Failed to start scan thread pool")?;
+
+    let bar = ProgressBar::new(total as u64);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "Scanning {msg} [{wide_bar:.cyan/blue}] {percent:>3}% {pos}/{len} eta {eta}",
+        )
+        .expect("progress bar template is valid")
+        .progress_chars("█░"),
+    );
+
     let mut needs_crop = 0;
     let mut no_crop = 0;
     let mut errors = 0;
 
-    for (index, file) in video_files.iter().enumerate() {
-        println!();
-        println!(
-            "{}",
-            "----------------------------------------".bright_black()
-        );
-        println!(
-            "{} {}",
-            format!("[{}/{}]", index + 1, total).yellow(),
-            file.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .yellow()
-        );
+    for chunk_start in (0..total).step_by(SCAN_BATCH_SIZE) {
+        let chunk = &video_files[chunk_start..(chunk_start + SCAN_BATCH_SIZE).min(total)];
+        let chunk_rows: Vec<ScanRow> = pool.install(|| {
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(offset, file)| {
+                    scan_one(
+                        file,
+                        chunk_start + offset + 1,
+                        total,
+                        &input_dir,
+                        crop_detect_start,
+                        crop_detect_seconds,
+                        threshold,
+                        &bar,
+                    )
+                })
+                .collect::<Vec<ScanRow>>()
+        });
 
-        let relative = match file.strip_prefix(&input_dir) {
-            Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
-            Err(err) => {
-                eprintln!("{} {err:#}", "ERROR:".red().bold());
-                errors += 1;
-                continue;
+        let transaction = connection
+            .transaction()
+            .wrap_err("Failed to begin scan database transaction")?;
+        for row in &chunk_rows {
+            match row.status {
+                "error" => errors += 1,
+                _ if row.needs_crop => needs_crop += 1,
+                _ => no_crop += 1,
             }
-        };
-
-        let detection = match detect_crop(file, crop_detect_start, crop_detect_seconds) {
-            Ok(detection) => detection,
-            Err(err) => {
-                eprintln!("{} {err:#}", "ERROR:".red().bold());
-                errors += 1;
-                insert_scan_row(
-                    &connection,
-                    &relative,
-                    None,
-                    None,
-                    None,
-                    false,
-                    "error",
-                    scanned_at,
-                )?;
-                continue;
-            }
-        };
-
-        if detection.failed && detection.crop.is_none() {
-            eprintln!(
-                "{}",
-                "FAILED: FFmpeg returned an error during crop detection"
-                    .red()
-                    .bold()
-            );
-            detection.diagnostics.print();
-            errors += 1;
-            insert_scan_row(
-                &connection,
-                &relative,
-                None,
-                None,
-                None,
-                false,
-                "error",
-                scanned_at,
-            )?;
-            continue;
+            insert_scan_row(&transaction, row, scanned_at)?;
         }
-
-        let is_full_frame = detection
-            .crop
-            .as_deref()
-            .zip(detection.source_size)
-            .is_some_and(|(crop, size)| is_full_frame(crop, size));
-
-        let (crop, needs) = match &detection.crop {
-            Some(value) if !is_full_frame => {
-                println!("{}", format!("Needs cropping: crop={value}").green());
-                needs_crop += 1;
-                (Some(value.clone()), true)
-            }
-            Some(value) => {
-                println!("{}", "No black bars detected".yellow());
-                no_crop += 1;
-                (Some(value.clone()), false)
-            }
-            None => {
-                println!("{}", "No black bars detected".yellow());
-                no_crop += 1;
-                (None, false)
-            }
-        };
-        let (width, height) = detection
-            .source_size
-            .map(|(w, h)| (Some(w), Some(h)))
-            .unwrap_or((None, None));
-
-        insert_scan_row(
-            &connection,
-            &relative,
-            crop,
-            width,
-            height,
-            needs,
-            "scanned",
-            scanned_at,
-        )?;
+        transaction
+            .commit()
+            .wrap_err("Failed to write scan results")?;
     }
+
+    bar.finish_and_clear();
 
     connection
         .execute(
@@ -578,14 +595,133 @@ fn run_scan(
     Ok(())
 }
 
+/// Runs crop detection for a single file. Executed on the rayon pool; progress
+/// and per-file results are printed through the progress bar so the output
+/// stays intact while files finish in parallel.
+fn scan_one(
+    file: &Path,
+    index: usize,
+    total: usize,
+    input_dir: &Path,
+    crop_detect_start: u64,
+    crop_detect_seconds: u64,
+    threshold: u32,
+    bar: &ProgressBar,
+) -> ScanRow {
+    let name = file
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    bar.set_message(name.clone());
+
+    // indicatif drops lines printed through a hidden progress bar (piped
+    // output), so fall back to plain stderr printing in that case.
+    let print_line = |message: String| {
+        if bar.is_hidden() {
+            eprintln!("{message}");
+        } else {
+            bar.println(message);
+        }
+    };
+
+    let relative = file
+        .strip_prefix(input_dir)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| name.clone());
+
+    let error_row = |message: String| -> ScanRow {
+        print_line(message);
+        bar.inc(1);
+        ScanRow {
+            path: relative.clone(),
+            crop: None,
+            width: None,
+            height: None,
+            needs_crop: false,
+            status: "error",
+        }
+    };
+
+    let detection = match detect_crop(file, crop_detect_start, crop_detect_seconds) {
+        Ok(detection) => detection,
+        Err(err) => {
+            return error_row(format!(
+                "{} [{index}/{total}] {name}: {err:#}",
+                "ERROR:".red().bold()
+            ));
+        }
+    };
+
+    if detection.failed && detection.crop.is_none() {
+        let mut message = format!(
+            "{} [{index}/{total}] {name}: FFmpeg returned an error during crop detection",
+            "FAILED:".red().bold()
+        );
+        for line in &detection.diagnostics.errors {
+            message.push_str(&format!("\n  {line}"));
+        }
+        return error_row(message);
+    }
+
+    let negligible = detection
+        .crop
+        .as_deref()
+        .zip(detection.source_size)
+        .is_some_and(|(crop, size)| is_within_threshold(crop, size, threshold));
+
+    let row = match &detection.crop {
+        Some(value) if !negligible => {
+            print_line(format!(
+                "[{index}/{total}] {name}: {}",
+                format!("Needs cropping: crop={value}").green()
+            ));
+            ScanRow {
+                path: relative,
+                crop: Some(value.clone()),
+                width: detection.source_size.map(|(w, _)| w),
+                height: detection.source_size.map(|(_, h)| h),
+                needs_crop: true,
+                status: "scanned",
+            }
+        }
+        Some(value) => {
+            print_line(format!(
+                "[{index}/{total}] {name}: {}",
+                "No black bars detected".yellow()
+            ));
+            ScanRow {
+                path: relative,
+                crop: Some(value.clone()),
+                width: detection.source_size.map(|(w, _)| w),
+                height: detection.source_size.map(|(_, h)| h),
+                needs_crop: false,
+                status: "scanned",
+            }
+        }
+        None => {
+            print_line(format!(
+                "[{index}/{total}] {name}: {}",
+                "No black bars detected".yellow()
+            ));
+            ScanRow {
+                path: relative,
+                crop: None,
+                width: detection.source_size.map(|(w, _)| w),
+                height: detection.source_size.map(|(_, h)| h),
+                needs_crop: false,
+                status: "scanned",
+            }
+        }
+    };
+
+    bar.inc(1);
+    row
+}
+
 fn insert_scan_row(
     connection: &Connection,
-    path: &str,
-    crop: Option<String>,
-    width: Option<u32>,
-    height: Option<u32>,
-    needs_crop: bool,
-    status: &str,
+    row: &ScanRow,
     scanned_at: i64,
 ) -> color_eyre::Result<()> {
     connection
@@ -593,22 +729,24 @@ fn insert_scan_row(
             "INSERT INTO videos (path, crop, width, height, needs_crop, status, scanned_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                path,
-                crop,
-                width,
-                height,
-                needs_crop as i64,
-                status,
+                row.path,
+                row.crop,
+                row.width,
+                row.height,
+                row.needs_crop as i64,
+                row.status,
                 scanned_at
             ],
         )
-        .with_context(|| format!("Failed to index {path}"))?;
+        .with_context(|| format!("Failed to index {}", row.path))?;
     Ok(())
 }
 
 struct ScanEntry {
     path: String,
     crop: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
     needs_crop: bool,
 }
 
@@ -631,14 +769,16 @@ fn read_scan_db(db_path: &Path) -> color_eyre::Result<(PathBuf, Vec<ScanEntry>)>
         })?;
 
     let mut statement = connection
-        .prepare("SELECT path, crop, needs_crop FROM videos ORDER BY path")
+        .prepare("SELECT path, crop, width, height, needs_crop FROM videos ORDER BY path")
         .with_context(|| format!("Failed to read scan database: {}", db_path.display()))?;
     let entries = statement
         .query_map([], |row| {
             Ok(ScanEntry {
                 path: row.get(0)?,
                 crop: row.get(1)?,
-                needs_crop: row.get::<_, i64>(2)? != 0,
+                width: row.get(2)?,
+                height: row.get(3)?,
+                needs_crop: row.get::<_, i64>(4)? != 0,
             })
         })
         .wrap_err("Failed to read scan database")?
@@ -710,8 +850,18 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
 
         for entry in entries {
             let source = if entry.needs_crop {
-                match entry.crop {
-                    Some(crop) => CropSource::Scan(Some(crop)),
+                match &entry.crop {
+                    // Re-apply the threshold at crop time so it can be more
+                    // aggressive than the one used during the scan; files the
+                    // scan already cleared are never re-cropped.
+                    Some(crop)
+                        if entry.width.zip(entry.height).is_some_and(|(w, h)| {
+                            is_within_threshold(crop, (w, h), encode.threshold)
+                        }) =>
+                    {
+                        CropSource::Scan(None)
+                    }
+                    Some(crop) => CropSource::Scan(Some(crop.clone())),
                     None => CropSource::Detect,
                 }
             } else {
@@ -934,13 +1084,13 @@ fn process_file(
                 return Outcome::Failed;
             }
 
-            let is_full_frame = detection
+            let negligible = detection
                 .crop
                 .as_deref()
                 .zip(detection.source_size)
-                .is_some_and(|(crop, size)| is_full_frame(crop, size));
+                .is_some_and(|(crop, size)| is_within_threshold(crop, size, encode.threshold));
 
-            detection.crop.filter(|_| !is_full_frame)
+            detection.crop.filter(|_| !negligible)
         }
     };
 
@@ -1303,10 +1453,36 @@ mod tests {
     }
 
     #[test]
-    fn full_frame_crops_are_detected() {
-        assert!(is_full_frame("1920:1080:0:0", (1920, 1080)));
-        assert!(!is_full_frame("1920:800:0:140", (1920, 1080)));
-        assert!(!is_full_frame("1920:1072:0:0", (1920, 1080)));
+    fn threshold_accepts_full_frames_at_zero() {
+        assert!(is_within_threshold("1920:1080:0:0", (1920, 1080), 0));
+        assert!(!is_within_threshold("1920:800:0:140", (1920, 1080), 0));
+        assert!(!is_within_threshold("1920:1072:0:0", (1920, 1080), 0));
+    }
+
+    #[test]
+    fn threshold_ignores_rounding_artifacts() {
+        // 4px trimmed from top and bottom: a round-to-16 artifact, not real
+        // letterboxing.
+        assert!(is_within_threshold("1920:1072:0:4", (1920, 1080), 8));
+        assert!(!is_within_threshold("1920:1072:0:4", (1920, 1080), 3));
+    }
+
+    #[test]
+    fn threshold_keeps_real_letterboxing() {
+        // 20px on top and bottom (1.85:1 content in a 16:9 frame) and 140px
+        // (2.35:1) must both still be cropped at the default threshold.
+        assert!(!is_within_threshold("1920:1040:0:20", (1920, 1080), 8));
+        assert!(!is_within_threshold("1920:800:0:140", (1920, 1080), 8));
+        // Pillarboxing (4:3 content) is likewise kept.
+        assert!(!is_within_threshold("1440:1080:240:0", (1920, 1080), 8));
+    }
+
+    #[test]
+    fn threshold_rejects_malformed_or_impossible_crops() {
+        assert!(!is_within_threshold("1920:1080", (1920, 1080), 8));
+        assert!(!is_within_threshold("", (1920, 1080), 8));
+        // A crop wider than the source frame cannot be trusted.
+        assert!(!is_within_threshold("1920:240:0:0", (320, 240), 8));
     }
 
     #[test]

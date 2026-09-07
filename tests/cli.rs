@@ -669,6 +669,94 @@ fn crop_detect_start_controls_detection_window() {
 }
 
 #[test]
+fn threshold_ignores_negligible_bars() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    // crop=320:176:0:32 trims 32px from the top and bottom edges.
+    create_letterboxed_video(&input_dir, "video.mkv", false);
+    let output_dir = temp.path().join("output");
+
+    // Default threshold (8px): the 32px bars are real and get cropped.
+    let db = temp.path().join("default.sqlite");
+    let log = run_scan(&input_dir, &db);
+    assert!(
+        log.contains("Needs cropping: crop=320:176:0:32"),
+        "log:\n{log}"
+    );
+    assert_eq!(count_database_rows(&db, true), 1);
+    assert_eq!(count_database_rows(&db, false), 0);
+
+    // A threshold above the bar size treats the file as needing no crop.
+    let db = temp.path().join("thresholded.sqlite");
+    let log = run_scan_with(&input_dir, &db, &["--threshold", "100"]);
+    assert!(log.contains("No black bars detected"), "log:\n{log}");
+    assert_eq!(count_database_rows(&db, true), 0);
+    assert_eq!(count_database_rows(&db, false), 1);
+
+    // Cropping from a scan database re-applies the threshold, so a higher
+    // value than the scan's can still skip files.
+    let db = temp.path().join("default.sqlite");
+    let log = run_tool_with(&db, &output_dir, &["--threshold", "100"]);
+    assert!(
+        log.contains("No black bars detected - skipping"),
+        "log:\n{log}"
+    );
+    assert!(!output_dir.join("video.mkv").exists());
+}
+
+#[test]
+fn parallel_scan_produces_the_same_index() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_letterboxed_video(&input_dir, "a-letterboxed.mkv", false);
+    create_full_frame_video(&input_dir, "b-full.mkv");
+    create_mixed_video(&input_dir, "c-mixed.mkv");
+
+    let serial_db = temp.path().join("serial.sqlite");
+    run_scan(&input_dir, &serial_db);
+
+    let parallel_db = temp.path().join("parallel.sqlite");
+    run_scan_with(&input_dir, &parallel_db, &["-j", "4"]);
+
+    let connection = Connection::open(&parallel_db).unwrap();
+    let mut statement = connection
+        .prepare("SELECT path, crop, needs_crop FROM videos ORDER BY path")
+        .unwrap();
+    let parallel_rows: Vec<(String, Option<String>, bool)> = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    let connection = Connection::open(&serial_db).unwrap();
+    let mut statement = connection
+        .prepare("SELECT path, crop, needs_crop FROM videos ORDER BY path")
+        .unwrap();
+    let serial_rows: Vec<(String, Option<String>, bool)> = statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert_eq!(parallel_rows.len(), 3);
+    assert_eq!(parallel_rows, serial_rows);
+}
+
+#[test]
 fn existing_output_files_are_skipped() {
     if !ffmpeg_and_ffprobe_available() {
         return;

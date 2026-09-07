@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Parallel scanning: `scan` detects crops on multiple videos concurrently
+  using rayon (`-j` / `--parallel`, defaulting to the CPU core count).
+  Results are buffered in memory and written to the scan database in batches
+  of 100, with a progress bar showing overall scan progress.
+- `--threshold` option for `scan` and `crop` (default 8 pixels): detected
+  crops that trim at most this many pixels from any edge of the frame are
+  treated as needing no crop, so round-to-16 detection artifacts no longer
+  trigger pointless re-encodes. Cropping from a scan database re-applies the
+  threshold against the indexed crop values.
 - `--crop-detect-start` option for `scan` and `crop`: chooses where crop
   detection starts in each video (default 30s), used together with
   `--crop-detect-seconds` to control the analyzed window.
