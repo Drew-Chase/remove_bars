@@ -63,10 +63,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Scan a directory and index which videos need cropping into an SQLite
-    /// database, without modifying any files
+    /// Scan a directory or a single media file and index which videos need
+    /// cropping into an SQLite database, without modifying any files
     Scan {
-        /// Directory containing the videos to scan
+        /// Directory or media file to scan
         #[arg(short, long, default_value = "input")]
         input: PathBuf,
 
@@ -92,9 +92,10 @@ enum Command {
         threshold: u32,
     },
 
-    /// Crop videos in a directory, or videos indexed by a previous scan
+    /// Crop videos in a directory, a single media file, or videos indexed by
+    /// a previous scan
     Crop {
-        /// Directory of videos, or a scan database file
+        /// Directory of videos, a single media file, or a scan database file
         #[arg(short, long, default_value = "input")]
         input: PathBuf,
 
@@ -148,7 +149,170 @@ struct EncodeArgs {
     overwrite_original: bool,
 }
 
-const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "mov", "wmv", "m4v", "webm"];
+/// Media file extensions, used as a fallback when a file's header bytes do
+/// not match a known container signature (e.g. very small or unusual files).
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mkv", "mp4", "avi", "mov", "wmv", "m4v", "webm", "ts", "m2ts", "mts", "mpg", "mpeg", "vob",
+    "flv", "ogg", "3gp", "asf", "rm", "rmvb",
+];
+
+/// The kind of a file, determined from its header bytes with the extension as
+/// a fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileKind {
+    /// A media container ffmpeg can read
+    Media,
+    /// An SQLite database (a scan database)
+    ScanDatabase,
+    /// Anything else: text, images, empty files, ...
+    Unknown,
+}
+
+/// Number of header bytes read from a file for magic-byte detection. Must
+/// cover the MPEG-TS sync-byte check at offset 376.
+const SNIFF_BYTES: usize = 512;
+
+/// File signatures, matched against the bytes at a given offset. Content is
+/// checked before extensions, so a media file with an unusual extension (or
+/// none) is still recognized, and a database renamed to a media extension is
+/// never mistaken for a video.
+const SQLITE_SIGNATURE: &[u8] = b"SQLite format 3\0";
+const EBML_SIGNATURE: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3];
+const ASF_SIGNATURE: &[u8] = &[
+    0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C,
+];
+const MPEG_PS_SIGNATURE: &[u8] = &[0x00, 0x00, 0x01, 0xBA];
+const REALMEDIA_SIGNATURE: &[u8] = b".RMF";
+const FLV_SIGNATURE: &[u8] = b"FLV\x01";
+const OGG_SIGNATURE: &[u8] = b"OggS";
+
+/// Returns true when `header` contains `signature` starting at `offset`.
+fn header_has(header: &[u8], offset: usize, signature: &[u8]) -> bool {
+    header.len() >= offset + signature.len()
+        && &header[offset..offset + signature.len()] == signature
+}
+
+/// Reads up to `SNIFF_BYTES` header bytes from a file. Returns an empty
+/// vector when the file cannot be opened or read.
+fn read_header(path: &Path) -> Vec<u8> {
+    let mut header = vec![0u8; SNIFF_BYTES];
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(_) => break,
+        }
+    }
+    header.truncate(filled);
+    header
+}
+
+/// Identifies the media container from header bytes and returns the name of
+/// the ffmpeg muxer that produces it.
+fn container_format(header: &[u8]) -> Option<&'static str> {
+    // Matroska (mkv) and WebM
+    if header_has(header, 0, EBML_SIGNATURE) {
+        Some("matroska")
+    }
+    // ISO base media: mp4, m4v, mov, 3gp. Only the `ftyp` brand box is
+    // matched; generic box names such as `free` also occur in ordinary text
+    // ("the free ...").
+    else if header_has(header, 4, b"ftyp") {
+        Some("mp4")
+    }
+    // Audio/Video Interleaved; the list id at offset 8 separates it from
+    // other RIFF files such as WAV
+    else if header_has(header, 0, b"RIFF") && header_has(header, 8, b"AVI ") {
+        Some("avi")
+    }
+    // Windows Media (wmv, asf)
+    else if header_has(header, 0, ASF_SIGNATURE) {
+        Some("asf")
+    }
+    // Flash video
+    else if header_has(header, 0, FLV_SIGNATURE) {
+        Some("flv")
+    }
+    // Ogg (the container can hold video; audio-only files surface as ffmpeg
+    // errors during processing)
+    else if header_has(header, 0, OGG_SIGNATURE) {
+        Some("ogg")
+    }
+    // MPEG program streams (mpg, vob)
+    else if header_has(header, 0, MPEG_PS_SIGNATURE) {
+        Some("mpeg")
+    }
+    // MPEG transport streams (ts): fixed 188-byte packets starting with the
+    // 0x47 sync byte. Requiring it at the first three packet boundaries keeps
+    // ordinary data files from matching.
+    else if header.len() > 376 && header[0] == 0x47 && header[188] == 0x47 && header[376] == 0x47
+    {
+        Some("mpegts")
+    }
+    // RealMedia (rm, rmvb)
+    else if header_has(header, 0, REALMEDIA_SIGNATURE) {
+        Some("rm")
+    } else {
+        None
+    }
+}
+
+/// Classifies file content from its header bytes alone.
+fn classify_header(header: &[u8]) -> FileKind {
+    // The database check must come first so that a database passed under any
+    // name is never treated as a media file.
+    if header_has(header, 0, SQLITE_SIGNATURE) {
+        return FileKind::ScanDatabase;
+    }
+
+    if container_format(header).is_some() {
+        return FileKind::Media;
+    }
+
+    FileKind::Unknown
+}
+
+/// Returns the ffmpeg muxer to force for `output`, or `None` when its
+/// extension already identifies one. Outputs keep the input's file name, so
+/// for inputs with unusual extensions the muxer is derived from the input
+/// container's magic bytes instead.
+fn output_format(input: &Path, output: &Path) -> Option<&'static str> {
+    let extension_identifies_muxer = output
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()));
+    if extension_identifies_muxer {
+        return None;
+    }
+    container_format(&read_header(input))
+}
+
+/// Classifies a file by its header bytes, falling back to its extension when
+/// the content is unrecognized. Files with a known media extension but
+/// unrecognized content are still treated as media, so unusual muxers that
+/// ffmpeg handles are not rejected outright.
+fn classify_file(path: &Path) -> FileKind {
+    let header = read_header(path);
+
+    let by_content = classify_header(&header);
+    if by_content != FileKind::Unknown {
+        return by_content;
+    }
+
+    let has_media_extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()));
+    if has_media_extension {
+        return FileKind::Media;
+    }
+
+    FileKind::Unknown
+}
 
 const CROP_DETECT_FILTER: &str = "cropdetect=24:16:0";
 
@@ -458,6 +622,58 @@ struct ScanRow {
 /// SQLite database in a single transaction.
 const SCAN_BATCH_SIZE: usize = 100;
 
+/// The resolved input for a scan: the media files to scan and the directory
+/// their stored paths are relative to.
+struct ScanInput {
+    /// Path shown in the header output (the directory, or the single file)
+    label: PathBuf,
+    /// Canonical directory that scanned files are stored relative to
+    root: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+/// Resolves the scan input to the media files to scan. A directory is
+/// searched recursively; a single media file is scanned on its own, with its
+/// parent directory as the root so cropping from the resulting database keeps
+/// working.
+fn resolve_scan_input(input: &Path) -> color_eyre::Result<ScanInput> {
+    if input.is_dir() {
+        let root = resolve_existing_dir(input, "Input")?;
+        let files = find_media_files(&root);
+        return Ok(ScanInput {
+            label: root.clone(),
+            root,
+            files,
+        });
+    }
+
+    if input.is_file() {
+        return match classify_file(input) {
+            FileKind::Media => {
+                let file = input.canonicalize().wrap_err_with(|| {
+                    format!("Failed to resolve input path: {}", input.display())
+                })?;
+                let root = file
+                    .parent()
+                    .expect("a canonicalized file path always has a parent")
+                    .to_path_buf();
+                Ok(ScanInput {
+                    label: file.clone(),
+                    root,
+                    files: vec![file],
+                })
+            }
+            FileKind::ScanDatabase => bail!(
+                "Input is a scan database; scan expects a directory or a media file: {}",
+                input.display()
+            ),
+            FileKind::Unknown => bail!("Input is not a recognized media file: {}", input.display()),
+        };
+    }
+
+    bail!("Input path does not exist: {}", input.display());
+}
+
 fn run_scan(
     input: PathBuf,
     output: PathBuf,
@@ -468,12 +684,13 @@ fn run_scan(
 ) -> color_eyre::Result<()> {
     ensure_ffmpeg()?;
 
-    let input_dir = resolve_existing_dir(&input, "Input")?;
-    let video_files = find_video_files(&input_dir);
+    let scan_input = resolve_scan_input(&input)?;
+    let video_files = scan_input.files;
+    let input_root = scan_input.root;
     let total = video_files.len();
 
     print_header();
-    println!("Input:    {}", input_dir.display());
+    println!("Input:    {}", scan_input.label.display());
     println!("Database: {}", output.display());
     println!(
         "Parallel: {parallel} | Window: {}s..{}s | Threshold: {threshold}px",
@@ -548,7 +765,7 @@ fn run_scan(
                         file,
                         chunk_start + offset + 1,
                         total,
-                        &input_dir,
+                        &input_root,
                         crop_detect_start,
                         crop_detect_seconds,
                         threshold,
@@ -580,7 +797,7 @@ fn run_scan(
     connection
         .execute(
             "INSERT INTO meta (key, value) VALUES ('input_root', ?1)",
-            params![input_dir.to_string_lossy()],
+            params![input_root.to_string_lossy()],
         )
         .wrap_err("Failed to write scan metadata")?;
 
@@ -923,7 +1140,7 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
     print_header();
     if input.is_dir() {
         let input_dir = resolve_existing_dir(&input, "Input")?;
-        let video_files = find_video_files(&input_dir);
+        let video_files = find_media_files(&input_dir);
         println!("Input:  {}", input_dir.display());
         print_output_target(&output_mode);
         println!("Found {} video file(s) to process", video_files.len());
@@ -942,75 +1159,99 @@ fn run_crop(input: PathBuf, output: PathBuf, encode: EncodeArgs) -> color_eyre::
             });
         }
     } else if input.is_file() {
-        if !input.exists() {
-            bail!("Scan database not found: {}", input.display());
-        }
-        let connection = open_scan_db(&input)?;
-        let (input_root, entries) = read_scan_index(&connection)?;
-        db_connection = Some(connection);
-        let input_root = input_root.canonicalize().with_context(|| {
-            format!(
-                "Scanned input root no longer exists: {}",
-                input_root.display()
-            )
-        })?;
-        println!("Scan:   {}", input.display());
-        println!("Input:  {}", input_root.display());
-        print_output_target(&output_mode);
+        match classify_file(&input) {
+            FileKind::ScanDatabase => {
+                let connection = open_scan_db(&input)?;
+                let (input_root, entries) = read_scan_index(&connection)?;
+                db_connection = Some(connection);
+                let input_root = input_root.canonicalize().with_context(|| {
+                    format!(
+                        "Scanned input root no longer exists: {}",
+                        input_root.display()
+                    )
+                })?;
+                println!("Scan:   {}", input.display());
+                println!("Input:  {}", input_root.display());
+                print_output_target(&output_mode);
 
-        let needs_crop = entries.iter().filter(|entry| entry.needs_crop).count();
-        already_cropped = entries
-            .iter()
-            .filter(|entry| entry.cropped_at.is_some())
-            .count();
-        println!(
-            "Indexed {} video file(s), {} need cropping",
-            entries.len(),
-            needs_crop
-        );
-        if already_cropped > 0 {
-            println!(
-                "Resuming: {} file(s) already cropped and will be skipped",
-                already_cropped
-            );
-        }
-        println!("{}", "========================================".cyan());
-
-        for entry in entries {
-            if entry.cropped_at.is_some() {
-                continue;
-            }
-
-            let source = if entry.needs_crop {
-                match &entry.crop {
-                    // Re-apply the threshold at crop time so it can be more
-                    // aggressive than the one used during the scan; files the
-                    // scan already cleared are never re-cropped.
-                    Some(crop)
-                        if entry.width.zip(entry.height).is_some_and(|(w, h)| {
-                            is_within_threshold(crop, (w, h), encode.threshold)
-                        }) =>
-                    {
-                        CropSource::Scan(None)
-                    }
-                    Some(crop) => CropSource::Scan(Some(crop.clone())),
-                    None => CropSource::Detect,
+                let needs_crop = entries.iter().filter(|entry| entry.needs_crop).count();
+                already_cropped = entries
+                    .iter()
+                    .filter(|entry| entry.cropped_at.is_some())
+                    .count();
+                println!(
+                    "Indexed {} video file(s), {} need cropping",
+                    entries.len(),
+                    needs_crop
+                );
+                if already_cropped > 0 {
+                    println!(
+                        "Resuming: {} file(s) already cropped and will be skipped",
+                        already_cropped
+                    );
                 }
-            } else {
-                CropSource::Scan(None)
-            };
-            jobs.push(CropJob {
-                file: input_root.join(&entry.path),
-                relative: PathBuf::from(&entry.path),
-                source,
-                index_path: Some(entry.path),
-            });
+                println!("{}", "========================================".cyan());
+
+                for entry in entries {
+                    if entry.cropped_at.is_some() {
+                        continue;
+                    }
+
+                    let source = if entry.needs_crop {
+                        match &entry.crop {
+                            // Re-apply the threshold at crop time so it can be more
+                            // aggressive than the one used during the scan; files the
+                            // scan already cleared are never re-cropped.
+                            Some(crop)
+                                if entry.width.zip(entry.height).is_some_and(|(w, h)| {
+                                    is_within_threshold(crop, (w, h), encode.threshold)
+                                }) =>
+                            {
+                                CropSource::Scan(None)
+                            }
+                            Some(crop) => CropSource::Scan(Some(crop.clone())),
+                            None => CropSource::Detect,
+                        }
+                    } else {
+                        CropSource::Scan(None)
+                    };
+                    jobs.push(CropJob {
+                        file: input_root.join(&entry.path),
+                        relative: PathBuf::from(&entry.path),
+                        source,
+                        index_path: Some(entry.path),
+                    });
+                }
+            }
+            FileKind::Media => {
+                let file = input.canonicalize().wrap_err_with(|| {
+                    format!("Failed to resolve input path: {}", input.display())
+                })?;
+                let relative = PathBuf::from(
+                    file.file_name()
+                        .expect("a canonicalized file path always has a file name"),
+                );
+                println!("Input:  {}", file.display());
+                print_output_target(&output_mode);
+                println!("{}", "========================================".cyan());
+
+                jobs.push(CropJob {
+                    file,
+                    relative,
+                    source: CropSource::Detect,
+                    index_path: None,
+                });
+            }
+            FileKind::Unknown => bail!(
+                "Input is neither a recognized media file nor a scan database: {}",
+                input.display()
+            ),
         }
     } else if !input.exists() {
         bail!("Input path does not exist: {}", input.display());
     } else {
         bail!(
-            "Input path is neither a directory nor a scan database: {}",
+            "Input path is neither a directory nor a regular file: {}",
             input.display()
         );
     }
@@ -1165,18 +1406,15 @@ fn resolve_output_dir(path: &Path) -> color_eyre::Result<PathBuf> {
     resolve_existing_dir(path, "Output")
 }
 
-fn find_video_files(dir: &Path) -> Vec<PathBuf> {
+/// Collects the media files under `dir`. Each file's kind is determined from
+/// its header bytes, with the extension as a fallback, so media files with
+/// unusual extensions are found and databases or unrelated files are skipped.
+fn find_media_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = WalkDir::new(dir)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
-        })
+        .filter(|entry| classify_file(entry.path()) == FileKind::Media)
         .map(walkdir::DirEntry::into_path)
         .collect();
     files.sort();
@@ -1370,7 +1608,7 @@ fn detect_crop(input: &Path, start: u64, seconds: u64) -> color_eyre::Result<Cro
     command
         .hide_banner()
         .args(["-ss", &start.to_string()])
-        .input(input.to_string_lossy())
+        .input(input)
         .args(["-t", &seconds.to_string()])
         // `-vf` (and not sidecar's `.filter()`, which emits `-filter`) is
         // required so the filtergraph binds to video streams only; with bare
@@ -1439,7 +1677,7 @@ fn encode_video(
     command
         .hide_banner()
         .overwrite()
-        .input(input.to_string_lossy())
+        .input(input)
         .args(["-vf", crop_filter])
         .map("0")
         .args(video_encoder_args(
@@ -1448,8 +1686,16 @@ fn encode_video(
             &encode.preset,
         ))
         .codec_audio("copy")
-        .codec_subtitle("copy")
-        .output(output.to_string_lossy());
+        .codec_subtitle("copy");
+
+    // ffmpeg infers the muxer from the output file extension; when that
+    // extension is unknown (unusual input names are preserved), force the
+    // muxer matching the input container.
+    if let Some(format) = output_format(input, output) {
+        command.format(format);
+    }
+
+    command.output(output);
 
     if std::env::var("REMOVE_BARS_DEBUG").is_ok() {
         eprintln!(
@@ -1661,6 +1907,134 @@ mod tests {
         assert!(!is_within_threshold("", (1920, 1080), 8));
         // A crop wider than the source frame cannot be trusted.
         assert!(!is_within_threshold("1920:240:0:0", (320, 240), 8));
+    }
+
+    /// Writes `bytes` to a file with `name` inside a scratch directory and
+    /// classifies it.
+    fn classify_fixture(temp: &tempfile::TempDir, name: &str, bytes: &[u8]) -> FileKind {
+        let path = temp.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        classify_file(&path)
+    }
+
+    #[test]
+    fn classify_matches_containers_by_magic_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let mut database = b"SQLite format 3\0".to_vec();
+        database.extend_from_slice(&[0u8; 64]);
+        assert_eq!(
+            classify_fixture(&temp, "scan.sqlite", &database),
+            FileKind::ScanDatabase
+        );
+        // Magic bytes win over the extension.
+        assert_eq!(
+            classify_fixture(&temp, "video.mkv", &database),
+            FileKind::ScanDatabase
+        );
+
+        let ebml = [
+            0x1A, 0x45, 0xDF, 0xA3, 0x42, 0x82, 0x88, b'm', b'a', b't', b'r', b'o', b's', b'k',
+            b'a',
+        ];
+        assert_eq!(classify_fixture(&temp, "video.dat", &ebml), FileKind::Media);
+
+        let mut mp4 = 0x20u32.to_be_bytes().to_vec();
+        mp4.extend_from_slice(b"ftypisom");
+        assert_eq!(classify_fixture(&temp, "clip.x265", &mp4), FileKind::Media);
+
+        let mut avi = b"RIFF".to_vec();
+        avi.extend_from_slice(&0x24u32.to_be_bytes());
+        avi.extend_from_slice(b"AVI LIST");
+        assert_eq!(
+            classify_fixture(&temp, "movie.unknown", &avi),
+            FileKind::Media
+        );
+
+        let mut transport_stream = vec![0u8; 400];
+        transport_stream[0] = 0x47;
+        transport_stream[188] = 0x47;
+        transport_stream[376] = 0x47;
+        assert_eq!(
+            classify_fixture(&temp, "stream.blob", &transport_stream),
+            FileKind::Media
+        );
+    }
+
+    #[test]
+    fn classify_falls_back_to_the_extension() {
+        let temp = tempfile::tempdir().unwrap();
+
+        // Unrecognized content with a known media extension is still media.
+        assert_eq!(
+            classify_fixture(&temp, "video.mkv", b"not really a video"),
+            FileKind::Media
+        );
+        // Unknown content with an unknown extension is not.
+        assert_eq!(
+            classify_fixture(&temp, "notes.dat", b"plain text"),
+            FileKind::Unknown
+        );
+        // Text whose offset-4 bytes happen to spell a generic box name must
+        // not be classified as ISO base media.
+        assert_eq!(
+            classify_fixture(&temp, "article.txt", b"the free encyclopedia"),
+            FileKind::Unknown
+        );
+        // Empty files have neither content nor a usable signature.
+        assert_eq!(classify_fixture(&temp, "empty.bin", b""), FileKind::Unknown);
+    }
+
+    #[test]
+    fn container_format_maps_magic_bytes_to_muxers() {
+        assert_eq!(
+            container_format(&[0x1A, 0x45, 0xDF, 0xA3]),
+            Some("matroska")
+        );
+        assert_eq!(container_format(b"\x00\x00\x00\x20ftypisom"), Some("mp4"));
+        assert_eq!(
+            container_format(b"RIFF\x24\x00\x00\x00AVI LIST"),
+            Some("avi")
+        );
+
+        let mut transport_stream = vec![0u8; 400];
+        transport_stream[0] = 0x47;
+        transport_stream[188] = 0x47;
+        transport_stream[376] = 0x47;
+        assert_eq!(container_format(&transport_stream), Some("mpegts"));
+
+        assert_eq!(container_format(b"plain text"), None);
+        assert_eq!(container_format(&[]), None);
+    }
+
+    #[test]
+    fn output_format_is_forced_only_for_unknown_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("video.dat");
+        fs::write(&input, [0x1A, 0x45, 0xDF, 0xA3]).unwrap();
+
+        // Known output extension: ffmpeg infers the muxer itself.
+        assert_eq!(output_format(&input, Path::new("out/video.mkv")), None);
+        // Unknown output extension: force the muxer from the input's bytes.
+        assert_eq!(
+            output_format(&input, Path::new("out/video.dat")),
+            Some("matroska")
+        );
+    }
+
+    #[test]
+    fn classify_falls_back_to_the_extension_for_unreadable_files() {
+        // Nothing can be read, so the extension alone decides. This keeps the
+        // previous behavior for files that cannot be opened during a
+        // directory walk.
+        assert_eq!(
+            classify_file(Path::new("/nonexistent/path/video.mkv")),
+            FileKind::Media
+        );
+        assert_eq!(
+            classify_file(Path::new("/nonexistent/path/notes.dat")),
+            FileKind::Unknown
+        );
     }
 
     #[test]

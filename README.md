@@ -7,7 +7,7 @@ Batch-detect and remove black bars (letterboxing / pillarboxing) from videos usi
 
 ## How it works
 
-For every video found under the input directory:
+For every video found in the input (a directory tree or a single media file):
 
 1. `cropdetect` (noise limit 24, dimension rounding 16) analyzes a sample window of the video, starting 30 seconds in
 2. The most frequently reported `crop=W:H:X:Y` value is selected
@@ -50,16 +50,17 @@ This installs the `remove_bars` binary into `~/.cargo/bin`.
 ## Usage
 
 `remove_bars` has two subcommands: `scan` (index which videos need cropping
-into an SQLite database) and `crop` (crop videos in a directory, or videos
-indexed by a previous scan).
+into an SQLite database) and `crop` (crop videos in a directory, a single
+media file, or videos indexed by a previous scan).
 
 ### Scan
 
-Analyze every video under a directory and index the result into an SQLite
-database, without modifying any files:
+Analyze every video in a directory (or a single media file) and index the
+result into an SQLite database, without modifying any files:
 
 ```sh
 remove_bars scan -i ./videos -o scan.sqlite -j 8
+remove_bars scan -i movie.mkv -o scan.sqlite
 ```
 
 Detection runs in parallel (`-j` / `--parallel`, defaulting to the number of
@@ -77,13 +78,14 @@ detection noise does not trigger pointless re-encodes.
 
 ```sh
 remove_bars crop -i ./videos -o ./cropped
+remove_bars crop -i movie.mkv -o ./cropped
 remove_bars crop -i scan.sqlite -o ./cropped --overwrite-original -e nvenc
 ```
 
-`-i` accepts either a directory (crops are detected on the fly) or a scan
-database (the indexed crop values are reused, so detection is skipped). Files
-that were indexed but have since been moved or deleted are reported and
-skipped.
+`-i` accepts a directory (crops are detected on the fly), a single media file,
+or a scan database (the indexed crop values are reused, so detection is
+skipped). Files that were indexed but have since been moved or deleted are
+reported and skipped.
 
 Cropping from a scan database is **resumable**: each successfully cropped file
 is recorded in the database, so an interrupted run can simply be re-run —
@@ -95,7 +97,7 @@ resets progress.
 
 | Option | Value | Default | Description | Available in |
 |--------|-------|---------|-------------|--------------|
-| `-i`, `--input` | `<DIR>` / `<FILE>` | `input` | Directory of videos (or scan database for `crop`) | `scan`, `crop` |
+| `-i`, `--input` | `<DIR>` / `<FILE>` | `input` | Directory of videos, a single media file, or a scan database (`crop`) | `scan`, `crop` |
 | `-o`, `--output` | `<FILE>` / `<DIR>` | `scan.sqlite` / `output` | SQLite database file (`scan`) or output directory (`crop`) | `scan`, `crop` |
 | `-j`, `--parallel` | `<N>` | CPU count | Number of videos to scan in parallel | `scan` |
 | `-s`, `--crop-detect-seconds` | `<SECONDS>` | `60` | Seconds of video to analyze, starting at `--crop-detect-start` | `scan`, `crop` |
@@ -173,6 +175,12 @@ Total:     2
 
 ## Notes
 
+- Input files are identified by their header bytes (magic numbers), with the
+  file extension only as a fallback, so media files with unusual extensions
+  are still found and a scan database under any name is never mistaken for a
+  video
+- Encoded outputs keep the input's file name; when the extension does not
+  identify a muxer, the ffmpeg muxer is chosen from the detected container
 - Videos shorter than 30 seconds are copied unchanged, since crop detection starts 30s into the file
 - Crop dimensions are rounded to multiples of 16 pixels (ffmpeg `cropdetect round=16`)
 - Building from source: `cargo build --release`

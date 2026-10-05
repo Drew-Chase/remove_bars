@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Building against `ffmpeg-sidecar` 2.6, which `cargo install` picks up when it
+  re-resolves dependencies: ffmpeg input/output paths are now passed as
+  `&Path` instead of `Cow<str>`, satisfying the new `AsRef<OsStr>` bounds
+  (this also allows non-UTF-8 paths). The dependency requirement is now
+  `ffmpeg-sidecar = "2.6"`.
+
+### Added
+
+- `scan` and `crop` now accept a single media file as input, in addition to a
+  directory and (for `crop`) a scan database. Scanning a single file records
+  its parent directory as the input root, so cropping from the resulting
+  database works as usual.
+
+### Changed
+
+- Input files are identified by their header bytes (magic numbers) with the
+  file extension only as a fallback, so media files with unusual extensions
+  are found, and a scan database under any name is never mistaken for a video.
+  Encoded outputs keep the input's file name; when the extension does not
+  identify a muxer, the ffmpeg muxer is forced from the detected container.
+
 ## 1.0.1 - 2026-09-07
 
 ### Added

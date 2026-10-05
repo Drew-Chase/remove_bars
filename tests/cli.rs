@@ -16,11 +16,9 @@ fn ffmpeg_and_ffprobe_available() -> bool {
     ffmpeg && ffprobe
 }
 
-fn run_tool(input: &Path, output: &Path) -> String {
-    run_tool_with(input, output, &[])
-}
-
-fn run_tool_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
+/// Runs `crop` and returns whether it succeeded plus the combined output,
+/// without asserting on the result.
+fn run_tool_raw(input: &Path, output: &Path, extra_args: &[&str]) -> (bool, String) {
     let result = Command::new(TOOL)
         .args([
             "crop",
@@ -38,18 +36,25 @@ fn run_tool_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    (result.status.success(), log)
+}
+
+fn run_tool_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
+    let (success, log) = run_tool_raw(input, output, extra_args);
     assert!(
-        result.status.success(),
-        "remove_bars exited with {result:?}\n--- log ---\n{log}"
+        success,
+        "remove_bars exited with an error\n--- log ---\n{log}"
     );
     log
 }
 
-fn run_scan(input: &Path, output: &Path) -> String {
-    run_scan_with(input, output, &[])
+fn run_tool(input: &Path, output: &Path) -> String {
+    run_tool_with(input, output, &[])
 }
 
-fn run_scan_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
+/// Runs `scan` and returns whether it succeeded plus the combined output,
+/// without asserting on the result.
+fn run_scan_raw(input: &Path, output: &Path, extra_args: &[&str]) -> (bool, String) {
     let result = Command::new(TOOL)
         .args([
             "scan",
@@ -67,11 +72,20 @@ fn run_scan_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    (result.status.success(), log)
+}
+
+fn run_scan_with(input: &Path, output: &Path, extra_args: &[&str]) -> String {
+    let (success, log) = run_scan_raw(input, output, extra_args);
     assert!(
-        result.status.success(),
-        "remove_bars scan exited with {result:?}\n--- log ---\n{log}"
+        success,
+        "remove_bars scan exited with an error\n--- log ---\n{log}"
     );
     log
+}
+
+fn run_scan(input: &Path, output: &Path) -> String {
+    run_scan_with(input, output, &[])
 }
 
 fn count_database_rows(db: &Path, needs_crop: bool) -> usize {
@@ -926,4 +940,202 @@ fn existing_output_files_are_skipped() {
         "log:\n{log}"
     );
     assert_eq!(fs::read(&output_file).unwrap(), b"pre-existing");
+}
+
+#[test]
+fn single_media_file_is_cropped() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let video = create_letterboxed_video(temp.path(), "video.mkv", false);
+    let output_dir = temp.path().join("output");
+
+    let log = run_tool(&video, &output_dir);
+
+    assert!(log.contains("Detected: crop=320:176:0:32"), "log:\n{log}");
+    assert!(log.contains("SUCCESS"), "log:\n{log}");
+    assert_eq!(probe_video_size(&output_dir.join("video.mkv")), (320, 176));
+}
+
+#[test]
+fn single_media_file_can_be_overwritten_in_place() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let video = create_letterboxed_video(temp.path(), "video.mkv", false);
+    let output_dir = temp.path().join("output");
+
+    let log = run_tool_with(&video, &output_dir, &["--overwrite-original"]);
+
+    assert!(log.contains("original replaced"), "log:\n{log}");
+    assert_eq!(
+        probe_video_size(&video),
+        (320, 176),
+        "the original file should now contain the cropped video"
+    );
+    assert!(
+        !output_dir.exists(),
+        "output directory should not be created in in-place mode"
+    );
+}
+
+#[test]
+fn weird_extension_media_files_are_detected() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    let video = create_letterboxed_video(&input_dir, "video.mkv", false);
+    let weird = input_dir.join("video.dat");
+    fs::rename(&video, &weird).unwrap();
+    let output_dir = temp.path().join("output");
+
+    // Found when scanning a directory...
+    let log = run_tool(&input_dir, &output_dir);
+    assert!(log.contains("Detected: crop=320:176:0:32"), "log:\n{log}");
+    assert_eq!(probe_video_size(&output_dir.join("video.dat")), (320, 176));
+
+    // ...and when passed as a single file.
+    let single_output = temp.path().join("single-output");
+    let log = run_tool(&weird, &single_output);
+    assert!(log.contains("SUCCESS"), "log:\n{log}");
+    assert_eq!(
+        probe_video_size(&single_output.join("video.dat")),
+        (320, 176)
+    );
+}
+
+#[test]
+fn scan_accepts_a_single_media_file() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let video = create_letterboxed_video(temp.path(), "video.mkv", false);
+    let db = temp.path().join("scan.sqlite");
+
+    let log = run_scan(&video, &db);
+
+    assert!(
+        log.contains("Needs cropping: crop=320:176:0:32"),
+        "log:\n{log}"
+    );
+    let (crop, needs_crop, status) = read_crop_for(&db, "video.mkv");
+    assert_eq!(crop.as_deref(), Some("320:176:0:32"));
+    assert!(needs_crop);
+    assert_eq!(status, "scanned");
+
+    // The database can then be used to crop the scanned file.
+    let output_dir = temp.path().join("output");
+    let log = run_tool(&db, &output_dir);
+    assert!(
+        log.contains("Using scan result: crop=320:176:0:32"),
+        "log:\n{log}"
+    );
+    assert_eq!(probe_video_size(&output_dir.join("video.mkv")), (320, 176));
+}
+
+#[test]
+fn scan_rejects_a_database_as_input() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_letterboxed_video(&input_dir, "video.mkv", false);
+    let db = temp.path().join("scan.sqlite");
+    run_scan(&input_dir, &db);
+
+    let other_db = temp.path().join("other.sqlite");
+    let (success, log) = run_scan_raw(&db, &other_db, &[]);
+
+    assert!(
+        !success,
+        "scan should reject a scan database as input:\n{log}"
+    );
+    assert!(log.contains("scan database"), "log:\n{log}");
+}
+
+#[test]
+fn unrecognized_files_are_rejected_as_input() {
+    let temp = TempDir::new().unwrap();
+    let note = temp.path().join("note.txt");
+    fs::write(&note, "plain text, not a video").unwrap();
+    let db = temp.path().join("scan.sqlite");
+    let output_dir = temp.path().join("output");
+
+    let (success, log) = run_scan_raw(&note, &db, &[]);
+    assert!(!success, "scan should reject unrecognized files:\n{log}");
+    assert!(log.contains("not a recognized media file"), "log:\n{log}");
+
+    let (success, log) = run_tool_raw(&note, &output_dir, &[]);
+    assert!(!success, "crop should reject unrecognized files:\n{log}");
+    assert!(
+        log.contains("neither a recognized media file nor a scan database"),
+        "log:\n{log}"
+    );
+}
+
+#[test]
+fn scan_database_is_detected_by_magic_bytes() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_letterboxed_video(&input_dir, "video.mkv", false);
+    let db = temp.path().join("scan.sqlite");
+    run_scan(&input_dir, &db);
+    let renamed = temp.path().join("scan.dat");
+    fs::rename(&db, &renamed).unwrap();
+    let output_dir = temp.path().join("output");
+
+    let log = run_tool(&renamed, &output_dir);
+
+    assert!(
+        log.contains("Using scan result: crop=320:176:0:32"),
+        "log:\n{log}"
+    );
+    assert_eq!(probe_video_size(&output_dir.join("video.mkv")), (320, 176));
+}
+
+#[test]
+fn database_files_inside_a_directory_are_skipped() {
+    if !ffmpeg_and_ffprobe_available() {
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let input_dir = temp.path().join("input");
+    fs::create_dir(&input_dir).unwrap();
+    create_letterboxed_video(&input_dir, "video.mkv", false);
+    // A database with an unrecognized extension must be skipped by content,
+    // not by extension.
+    let mut database = b"SQLite format 3\0".to_vec();
+    database.extend_from_slice(&[0u8; 64]);
+    fs::write(input_dir.join("data.bin"), &database).unwrap();
+    let db = temp.path().join("scan.sqlite");
+    let output_dir = temp.path().join("output");
+
+    let log = run_scan(&input_dir, &db);
+    assert!(log.contains("Found 1 video file(s) to scan"), "log:\n{log}");
+
+    let log = run_tool(&input_dir, &output_dir);
+    assert!(log.contains("SUCCESS: video.mkv"), "log:\n{log}");
+    assert!(
+        !log.contains("data.bin"),
+        "the database file must be skipped:\n{log}"
+    );
 }
